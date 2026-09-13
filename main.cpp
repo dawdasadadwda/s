@@ -366,8 +366,7 @@ static void LoadConfig() {
             else if (key == "micid") g_cfg.micId = Utf8ToWide(val);
             else if (key == "capmode") g_cfg.captureMode = max(0, min(1, stoi(val)));
             else if (key == "wintitle") g_cfg.windowTitle = Utf8ToWide(val);
-        }
-        catch (...) {}
+        } catch (...) {}
     }
 }
 
@@ -680,24 +679,24 @@ public:
 private:
     static const int RING = 8;
 
+    // fila de wtex prontos para encodar
     struct EncodeQueue {
         mutex mtx;
         condition_variable cv;
         int slots[RING];
         int head = 0, tail = 0, count = 0;
 
-        bool PushIfRoom(int s) {
+        void Push(int s) {
             lock_guard<mutex> lk(mtx);
-            if (count == RING) return false;
+            if (count == RING) {
+                // descarta o mais antigo
+                head = (head + 1) % RING;
+                count--;
+            }
             slots[tail] = s;
             tail = (tail + 1) % RING;
             count++;
             cv.notify_one();
-            return true;
-        }
-        bool IsFull() {
-            lock_guard<mutex> lk(mtx);
-            return count == RING;
         }
         bool Pop(int& s, int timeoutMs) {
             unique_lock<mutex> lk(mtx);
@@ -706,6 +705,13 @@ private:
             head = (head + 1) % RING;
             count--;
             return true;
+        }
+        bool Contains(int s) {
+            lock_guard<mutex> lk(mtx);
+            for (int i = 0; i < count; i++) {
+                if (slots[(head + i) % RING] == s) return true;
+            }
+            return false;
         }
     };
     EncodeQueue m_queue;
@@ -747,12 +753,13 @@ private:
         LARGE_INTEGER qpf{}, t0{}, now{};
         UINT texW = 0, texH = 0, outW = 0, outH = 0, stageIdx = 0;
         UINT incomingW = 0, incomingH = 0;
-        bool comHere = false, mfHere = false;
+        bool wroteAny = false, comHere = false, mfHere = false;
         bool framePending = false;
         DWORD videoStreamIdx = 0;
         DWORD audioStreamIdx = 0;
         bool useSysAudio = false;
         bool useMic = false;
+        UINT64 writeCount = 0;
         double frameDurHns = 0.0;
         DXGI_OUTDUPL_DESC dupDesc{};
         string curFile = cfg.outputFile;
@@ -762,8 +769,8 @@ private:
         bool paused = false;
         chrono::steady_clock::time_point pauseStart;
         double nextWriteHns = 0.0;
+        double lastSampleTs = -1.0;
         atomic<bool> encoderDone{ false };
-        atomic<bool> wroteAny{ false };
 
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
         DWORD mmcssIdx = 0;
@@ -881,14 +888,16 @@ private:
             return S_OK;
             };
 
+        // Encode thread: consome wtex da fila e escreve no sink writer
         auto encodeThreadFn = [&]() {
             CoInitializeEx(nullptr, COINIT_MULTITHREADED);
             SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+
             double lastTs = -1.0;
             while (!m_stopFlag.load() || !encoderDone.load()) {
                 int slot = -1;
                 if (!m_queue.Pop(slot, 50)) {
-                    if (m_stopFlag.load() && encoderDone.load()) break;
+                    if (m_stopFlag.load()) break;
                     continue;
                 }
                 if (slot < 0 || slot >= RING) continue;
@@ -915,10 +924,10 @@ private:
                 s->SetSampleTime((LONGLONG)ts);
                 s->SetSampleDuration((LONGLONG)frameDurHns);
                 writer->WriteSample(videoStreamIdx, s.Get());
-                wroteAny.store(true);
+                wroteAny = true;
             }
             CoUninitialize();
-            };
+        };
 
         if (windowMode) {
             targetHwnd = FindWindowByTitle(cfg.windowTitle);
@@ -998,6 +1007,7 @@ private:
         QueryPerformanceCounter(&t0);
         frameDurHns = 10'000'000.0 / (double)cfg.fps;
         nextWriteHns = 0.0;
+        lastSampleTs = -1.0;
 
         {
             thread encTh(encodeThreadFn);
@@ -1058,6 +1068,7 @@ private:
                 continue;
             }
 
+            bool fresh = false;
             if (dupl.Get()) {
                 hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
                 if (hr == S_OK) {
@@ -1116,6 +1127,7 @@ private:
                     res.Reset();
                     dupl->ReleaseFrame();
                     framePending = false;
+                    fresh = true;
                 }
                 else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
                 }
@@ -1129,28 +1141,22 @@ private:
                 }
             }
 
-            // slot que vai usar
+            // Compor frame em wtex[wIdx] e enfileirar para o encoder
             UINT tryIdx = (wIdx + 1) % RING;
-            bool slotOk = true;
-            {
-                // verifica se já está na fila
-                // (o consumer libra após WriteSample, não temos um check direto)
-            }
-            // tenta enfileirar
-            // faz a composição no slot tryIdx e depois enfileira
-            wIdx = tryIdx;
-
-            LONG srcW = (LONG)min(incomingW, texW);
-            LONG srcH = (LONG)min(incomingH, texH);
-            if (srcW <= 0 || srcH <= 0) {
+            if (m_queue.Contains((int)tryIdx)) {
+                // slot ocupado na fila: descarta este frame
                 QueryPerformanceCounter(&now);
                 double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
                 nextWriteHns = nowHns + frameDurHns;
                 continue;
             }
 
-            bool wrote = false;
+            wIdx = tryIdx;
+            LONG srcW = (LONG)min(incomingW, texW);
+            LONG srcH = (LONG)min(incomingH, texH);
+            if (srcW <= 0 || srcH <= 0) continue;
 
+            bool wrote = false;
             if (windowMode && targetHwnd && IsWindow(targetHwnd) && !IsIconic(targetHwnd)) {
                 RECT cr{}; GetClientRect(targetHwnd, &cr);
                 POINT tl = { 0, 0 }; ClientToScreen(targetHwnd, &tl);
@@ -1160,28 +1166,8 @@ private:
                 if (ly < 0) { lh += ly; ly = 0; }
                 if (lx + lw > srcW) lw = srcW - lx;
                 if (ly + lh > srcH) lh = srcH - ly;
-
                 if (lw > 0 && lh > 0) {
-                    if ((UINT)lw == outW && (UINT)lh == outH) {
-                        // FAST PATH: crop direto via D3D11, sem D2D
-                        D3D11_BOX box = {};
-                        box.left = (UINT)lx; box.top = (UINT)ly; box.front = 0;
-                        box.right = (UINT)(lx + lw); box.bottom = (UINT)(ly + lh); box.back = 1;
-                        ctx->CopySubresourceRegion(wtex[wIdx].Get(), 0, 0, 0, 0, staging[stageIdx].Get(), 0, &box);
-
-                        // cursor overlay se necessário
-                        if (cfg.showCursor && d2dOk && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get() && frameBmp[wIdx].Get()) {
-                            d2dCtx->SetTarget(frameBmp[wIdx].Get());
-                            d2dCtx->BeginDraw();
-                            float dx = (float)(cursorX - orgX - lx - dcur.hx);
-                            float dy = (float)(cursorY - orgY - ly - dcur.hy);
-                            D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w, dy + (float)dcur.h);
-                            d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
-                            d2dCtx->EndDraw();
-                        }
-                        wrote = true;
-                    }
-                    else if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
+                    if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
                         d2dCtx->SetTarget(frameBmp[wIdx].Get());
                         d2dCtx->BeginDraw();
                         D2D1_RECT_F sr = D2D1::RectF((float)lx, (float)ly, (float)(lx + lw), (float)(ly + lh));
@@ -1192,29 +1178,16 @@ private:
                             float dx = (float)(cursorX - orgX - lx - dcur.hx) * sx;
                             float dy = (float)(cursorY - orgY - ly - dcur.hy) * sy;
                             D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w * sx, dy + (float)dcur.h * sy);
-                            d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                            d2dCtx->DrawBitmap(curBmp.Get(), &cdr);
                         }
-                        d2dCtx->EndDraw();
+                        HRESULT hd = d2dCtx->EndDraw();
+                        if (FAILED(hd)) { d2dOk = false; }
                         wrote = true;
                     }
                 }
             }
             else if (!windowMode) {
-                if (outW == texW && outH == texH) {
-                    // FAST PATH: copy direto, sem D2D
-                    ctx->CopyResource(wtex[wIdx].Get(), staging[stageIdx].Get());
-                    if (cfg.showCursor && d2dOk && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get() && frameBmp[wIdx].Get()) {
-                        d2dCtx->SetTarget(frameBmp[wIdx].Get());
-                        d2dCtx->BeginDraw();
-                        float dx = (float)(cursorX - orgX - dcur.hx);
-                        float dy = (float)(cursorY - orgY - dcur.hy);
-                        D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w, dy + (float)dcur.h);
-                        d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
-                        d2dCtx->EndDraw();
-                    }
-                    wrote = true;
-                }
-                else if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
+                if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
                     d2dCtx->SetTarget(frameBmp[wIdx].Get());
                     d2dCtx->BeginDraw();
                     D2D1_RECT_F sr = D2D1::RectF(0, 0, (float)srcW, (float)srcH);
@@ -1225,21 +1198,19 @@ private:
                         float dx = (float)(cursorX - orgX - dcur.hx) * sx;
                         float dy = (float)(cursorY - orgY - dcur.hy) * sy;
                         D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w * sx, dy + (float)dcur.h * sy);
-                        d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                        d2dCtx->DrawBitmap(curBmp.Get(), &cdr);
                     }
-                    d2dCtx->EndDraw();
-                    wrote = true;
+                    HRESULT hd = d2dCtx->EndDraw();
+                    if (FAILED(hd)) { d2dOk = false; }
                 }
                 else {
                     ctx->CopyResource(wtex[wIdx].Get(), staging[stageIdx].Get());
-                    wrote = true;
                 }
+                wrote = true;
             }
 
             if (wrote) {
-                if (!m_queue.PushIfRoom((int)wIdx)) {
-                    // fila cheia: frame descartado (encoder atrasado)
-                }
+                m_queue.Push((int)wIdx);
             }
 
             QueryPerformanceCounter(&now);
@@ -1250,10 +1221,10 @@ private:
     cleanup:
         encoderDone.store(true);
         m_queue.cv.notify_all();
-        Sleep(300);
+        Sleep(200);
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (m_mixer.IsRunning()) m_mixer.Stop();
-        if (!wroteAny.load()) {
+        if (!wroteAny) {
             writer.Reset();
             DeleteFileW(Utf8ToWide(curFile).c_str());
         }
@@ -1308,8 +1279,8 @@ static void RecordingScreen() {
     cout << " Arquivo: " << g_cfg.outputFile << "\n";
     cout << " Alvo   : " << (g_cfg.captureMode == 1 ? ("Janela: " + WideToUtf8(g_cfg.windowTitle)) : ("Monitor " + to_string(g_cfg.monitor))) << "\n";
     cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | " << g_cfg.format << " | " << ResLabel()
-        << " | audio " << (g_cfg.audioEnabled ? "Sim" : "Nao")
-        << " | mic " << (g_cfg.micEnabled ? "Sim" : "Nao") << "\n";
+         << " | audio " << (g_cfg.audioEnabled ? "Sim" : "Nao")
+         << " | mic " << (g_cfg.micEnabled ? "Sim" : "Nao") << "\n";
     SetColor(kTitle); cout << "--------------------------------------------------\n";
     SetColor(kGray); cout << " Duracao: " << flush;
     CONSOLE_SCREEN_BUFFER_INFO csbi{};
@@ -1516,7 +1487,7 @@ void mainmenu() {
         SetColor(kGray);
         cout << " Status : " << (g_recorder.IsRecording() ? "RECORDING" : "STOPPED") << "\n";
         cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | " << ResLabel() << " | " << g_cfg.format
-            << " | audio " << (g_cfg.audioEnabled ? "S" : "N") << " | mic " << (g_cfg.micEnabled ? "S" : "N") << "\n";
+             << " | audio " << (g_cfg.audioEnabled ? "S" : "N") << " | mic " << (g_cfg.micEnabled ? "S" : "N") << "\n";
         cout << " Alvo   : " << (g_cfg.captureMode == 1 ? ("Janela: " + WideToUtf8(g_cfg.windowTitle)) : ("Monitor " + to_string(g_cfg.monitor))) << "\n";
         string le = g_recorder.LastError();
         if (!le.empty()) { SetColor(kErr); cout << " Erro: " << le << "\n"; SetColor(kGray); }
