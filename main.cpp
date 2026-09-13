@@ -27,6 +27,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <condition_variable>
 #include <cstdint>
 #include <fstream>
 #include <iomanip>
@@ -231,10 +232,7 @@ static bool ReadIntConsole(const string& titulo, const string& prompt, int atual
     }
 }
 
-struct MonitorInfo {
-    wstring deviceName;
-    string nameUtf8;
-};
+struct MonitorInfo { wstring deviceName; string nameUtf8; };
 static vector<MonitorInfo> ListMonitors() {
     vector<MonitorInfo> out;
     ComPtr<IDXGIFactory1> factory;
@@ -255,14 +253,8 @@ static vector<MonitorInfo> ListMonitors() {
     return out;
 }
 
-struct WindowInfo {
-    HWND hwnd;
-    wstring title;
-};
-struct FindWindowData {
-    const wstring* target;
-    HWND found;
-};
+struct WindowInfo { HWND hwnd; wstring title; };
+struct FindWindowData { const wstring* target; HWND found; };
 static BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM lp) {
     FindWindowData* d = reinterpret_cast<FindWindowData*>(lp);
     int len = GetWindowTextLengthW(hwnd);
@@ -270,17 +262,13 @@ static BOOL CALLBACK FindWindowProc(HWND hwnd, LPARAM lp) {
     wstring title(len + 1, L'\0');
     GetWindowTextW(hwnd, &title[0], len + 1);
     title.resize(len);
-    if (title == *d->target) {
-        d->found = hwnd;
-        return FALSE;
-    }
+    if (title == *d->target) { d->found = hwnd; return FALSE; }
     return TRUE;
 }
 static BOOL CALLBACK EnumWindowsListProc(HWND hwnd, LPARAM lp) {
     vector<WindowInfo>* out = reinterpret_cast<vector<WindowInfo>*>(lp);
     if (!IsWindow(hwnd)) return TRUE;
-    DWORD pid = 0;
-    GetWindowThreadProcessId(hwnd, &pid);
+    DWORD pid = 0; GetWindowThreadProcessId(hwnd, &pid);
     if (pid == GetCurrentProcessId()) return TRUE;
     if (!IsWindowVisible(hwnd)) return TRUE;
     int len = GetWindowTextLengthW(hwnd);
@@ -294,12 +282,8 @@ static BOOL CALLBACK EnumWindowsListProc(HWND hwnd, LPARAM lp) {
     if (wcscmp(cls, L"ConsoleWindowClass") == 0) return TRUE;
     if (wcscmp(cls, L"Progman") == 0) return TRUE;
     if (wcscmp(cls, L"Shell_TrayWnd") == 0) return TRUE;
-    for (auto& w : *out) {
-        if (w.title == title) return TRUE;
-    }
-    WindowInfo wi;
-    wi.hwnd = hwnd;
-    wi.title = title;
+    for (auto& w : *out) if (w.title == title) return TRUE;
+    WindowInfo wi; wi.hwnd = hwnd; wi.title = title;
     out->push_back(wi);
     return TRUE;
 }
@@ -314,11 +298,7 @@ static HWND FindWindowByTitle(const wstring& title) {
     return d.found;
 }
 
-struct AudioDeviceInfo {
-    wstring id;
-    string nameUtf8;
-    bool isDefault;
-};
+struct AudioDeviceInfo { wstring id; string nameUtf8; bool isDefault; };
 static vector<AudioDeviceInfo> ListAudioDevices(EDataFlow flow) {
     vector<AudioDeviceInfo> out;
     ComPtr<IMMDeviceEnumerator> en;
@@ -331,8 +311,7 @@ static vector<AudioDeviceInfo> ListAudioDevices(EDataFlow flow) {
     }
     ComPtr<IMMDeviceCollection> col;
     if (FAILED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE | DEVICE_STATE_UNPLUGGED, &col))) return out;
-    UINT count = 0;
-    col->GetCount(&count);
+    UINT count = 0; col->GetCount(&count);
     for (UINT i = 0; i < count; i++) {
         ComPtr<IMMDevice> d;
         if (FAILED(col->Item(i, &d))) continue;
@@ -341,26 +320,19 @@ static vector<AudioDeviceInfo> ListAudioDevices(EDataFlow flow) {
         ComPtr<IPropertyStore> props;
         string name = "Desconhecido";
         if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &props))) {
-            PROPVARIANT pv;
-            PropVariantInit(&pv);
-            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR) {
+            PROPVARIANT pv; PropVariantInit(&pv);
+            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR)
                 name = WideToUtf8(pv.pwszVal);
-            }
             PropVariantClear(&pv);
         }
-        AudioDeviceInfo info;
-        info.id = id;
-        info.nameUtf8 = name;
-        info.isDefault = (defId == id);
-        out.push_back(info);
-        CoTaskMemFree(id);
+        AudioDeviceInfo info; info.id = id; info.nameUtf8 = name; info.isDefault = (defId == id);
+        out.push_back(info); CoTaskMemFree(id);
     }
     return out;
 }
 
 static void SaveConfig() {
-    ofstream f(kConfigFile);
-    if (!f) return;
+    ofstream f(kConfigFile); if (!f) return;
     f << "fps=" << g_cfg.fps << "\n";
     f << "bitrate=" << g_cfg.bitrateKbps << "\n";
     f << "monitor=" << g_cfg.monitor << "\n";
@@ -375,8 +347,7 @@ static void SaveConfig() {
     f << "wintitle=" << WideToUtf8(g_cfg.windowTitle) << "\n";
 }
 static void LoadConfig() {
-    ifstream f(kConfigFile);
-    if (!f) return;
+    ifstream f(kConfigFile); if (!f) return;
     string line;
     while (getline(f, line)) {
         size_t eq = line.find('=');
@@ -408,10 +379,7 @@ static bool ProbeDefaultEndpoint(EDataFlow flow) {
     return dev.Get() != nullptr;
 }
 
-struct DecodedCursor {
-    vector<BYTE> px;
-    int w = 0, h = 0, hx = 0, hy = 0;
-};
+struct DecodedCursor { vector<BYTE> px; int w = 0, h = 0, hx = 0, hy = 0; };
 static bool DecodeCursor(HICON hc, DecodedCursor& dc) {
     ICONINFO ii{};
     if (!GetIconInfo(hc, &ii)) return false;
@@ -426,13 +394,9 @@ static bool DecodeCursor(HICON hc, DecodedCursor& dc) {
     }
     BITMAPINFO bi{};
     bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
-    bi.bmiHeader.biWidth = w;
-    bi.bmiHeader.biHeight = -h;
-    bi.bmiHeader.biPlanes = 1;
-    bi.bmiHeader.biBitCount = 32;
-    bi.bmiHeader.biCompression = BI_RGB;
-    void* pb = nullptr;
-    void* pw = nullptr;
+    bi.bmiHeader.biWidth = w; bi.bmiHeader.biHeight = -h;
+    bi.bmiHeader.biPlanes = 1; bi.bmiHeader.biBitCount = 32; bi.bmiHeader.biCompression = BI_RGB;
+    void* pb = nullptr; void* pw = nullptr;
     HDC wdc = GetDC(nullptr);
     HDC mdc = CreateCompatibleDC(wdc);
     HBITMAP dibB = CreateDIBSection(wdc, &bi, DIB_RGB_COLORS, &pb, nullptr, 0);
@@ -454,9 +418,7 @@ static bool DecodeCursor(HICON hc, DecodedCursor& dc) {
             const BYTE* ww = W + i * 4;
             int dif = 0;
             for (int c = 0; c < 3; c++) { int d = ww[c] - b[c]; if (d > dif) dif = d; }
-            int a = 255 - dif;
-            if (a < 0) a = 0;
-            if (a > 255) a = 255;
+            int a = 255 - dif; if (a < 0) a = 0; if (a > 255) a = 255;
             BYTE* o = &dc.px[(size_t)i * 4];
             o[0] = b[0]; o[1] = b[1]; o[2] = b[2]; o[3] = (BYTE)a;
         }
@@ -465,8 +427,7 @@ static bool DecodeCursor(HICON hc, DecodedCursor& dc) {
     }
     if (dibB) DeleteObject(dibB);
     if (dibW) DeleteObject(dibW);
-    DeleteDC(mdc);
-    ReleaseDC(nullptr, wdc);
+    DeleteDC(mdc); ReleaseDC(nullptr, wdc);
     if (ii.hbmMask) DeleteObject(ii.hbmMask);
     if (ii.hbmColor) DeleteObject(ii.hbmColor);
     return ok;
@@ -481,17 +442,11 @@ struct AudioBuffer {
         const size_t MAX = 48000 * 4 * 2;
         if (data.size() > MAX) data.erase(data.begin(), data.begin() + (data.size() - MAX));
     }
-    size_t Available() {
-        lock_guard<mutex> lk(mtx);
-        return data.size();
-    }
+    size_t Available() { lock_guard<mutex> lk(mtx); return data.size(); }
     size_t Pop(BYTE* dst, size_t bytes) {
         lock_guard<mutex> lk(mtx);
         size_t n = min(bytes, data.size());
-        if (n > 0) {
-            memcpy(dst, data.data(), n);
-            data.erase(data.begin(), data.begin() + n);
-        }
+        if (n > 0) { memcpy(dst, data.data(), n); data.erase(data.begin(), data.begin() + n); }
         return n;
     }
     void Clear() { lock_guard<mutex> lk(mtx); data.clear(); }
@@ -504,22 +459,11 @@ public:
         if (m_running.load()) return false;
         if (m_thread.joinable()) m_thread.join();
         m_stopFlag.store(false);
-        m_writer = writer;
-        m_streamIdx = streamIdx;
-        m_deviceId = deviceId;
-        m_buffer = buffer;
+        m_writer = writer; m_streamIdx = streamIdx; m_deviceId = deviceId; m_buffer = buffer;
         m_lastError.clear();
-        try {
-            m_thread = thread(&AudioCapture::ThreadProc, this);
-        }
-        catch (...) {
-            m_lastError = "falha ao criar thread de audio";
-            return false;
-        }
-        for (int i = 0; i < 200; i++) {
-            if (m_running.load() || !m_lastError.empty()) break;
-            Sleep(10);
-        }
+        try { m_thread = thread(&AudioCapture::ThreadProc, this); }
+        catch (...) { m_lastError = "falha thread audio"; return false; }
+        for (int i = 0; i < 200; i++) { if (m_running.load() || !m_lastError.empty()) break; Sleep(10); }
         return m_lastError.empty();
     }
     void Stop() {
@@ -544,75 +488,43 @@ private:
         do {
             hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
             if (FAILED(hr)) { m_lastError = "MMDeviceEnumerator falhou"; break; }
-
-            if (m_deviceId.empty()) {
-                hr = enumerator->GetDefaultAudioEndpoint(m_isMic ? eCapture : eRender, eConsole, &device);
-            }
-            else {
-                hr = enumerator->GetDevice(m_deviceId.c_str(), &device);
-                if (FAILED(hr)) hr = enumerator->GetDefaultAudioEndpoint(m_isMic ? eCapture : eRender, eConsole, &device);
-            }
-            if (FAILED(hr)) { m_lastError = m_isMic ? "nenhum microfone padrao" : "nenhum dispositivo de saida"; break; }
-
+            if (m_deviceId.empty()) hr = enumerator->GetDefaultAudioEndpoint(m_isMic ? eCapture : eRender, eConsole, &device);
+            else { hr = enumerator->GetDevice(m_deviceId.c_str(), &device); if (FAILED(hr)) hr = enumerator->GetDefaultAudioEndpoint(m_isMic ? eCapture : eRender, eConsole, &device); }
+            if (FAILED(hr)) { m_lastError = m_isMic ? "sem microfone" : "sem saida"; break; }
             hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
-            if (FAILED(hr)) { m_lastError = "IAudioClient Activate falhou"; break; }
-
+            if (FAILED(hr)) { m_lastError = "Activate falhou"; break; }
             WAVEFORMATEX wf{};
             wf.wFormatTag = WAVE_FORMAT_PCM;
-            wf.nChannels = 2;
-            wf.nSamplesPerSec = 48000;
-            wf.wBitsPerSample = 16;
-            wf.nBlockAlign = (WORD)((wf.nChannels * wf.wBitsPerSample) / 8);
-            wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
-            wf.cbSize = 0;
-
-            DWORD initFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
-                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
-                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+            wf.nChannels = 2; wf.nSamplesPerSec = 48000; wf.wBitsPerSample = 16;
+            wf.nBlockAlign = 4; wf.nAvgBytesPerSec = 48000 * 4; wf.cbSize = 0;
+            DWORD initFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK | AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM | AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
             if (!m_isMic) initFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
-
             hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags, 1000000, 0, &wf, nullptr);
-            if (FAILED(hr)) { m_lastError = "IAudioClient Initialize falhou"; break; }
-
+            if (FAILED(hr)) { m_lastError = "Init falhou"; break; }
             hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
             if (!hEvent) { m_lastError = "CreateEvent falhou"; break; }
-
             hr = audioClient->SetEventHandle(hEvent);
             if (FAILED(hr)) { m_lastError = "SetEventHandle falhou"; break; }
-
             hr = audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient);
-            if (FAILED(hr)) { m_lastError = "GetService(IAudioCaptureClient) falhou"; break; }
-
+            if (FAILED(hr)) { m_lastError = "GetService falhou"; break; }
             hr = audioClient->Start();
-            if (FAILED(hr)) { m_lastError = "IAudioClient Start falhou"; break; }
-
+            if (FAILED(hr)) { m_lastError = "Start falhou"; break; }
             m_running.store(true);
             LONGLONG samplePos = 0;
-
             while (!m_stopFlag.load()) {
                 DWORD wait = WaitForSingleObject(hEvent, 100);
                 if (wait != WAIT_OBJECT_0) continue;
                 if (m_stopFlag.load()) break;
-
                 UINT32 packetLength = 0;
                 hr = captureClient->GetNextPacketSize(&packetLength);
                 while (SUCCEEDED(hr) && packetLength > 0 && !m_stopFlag.load()) {
-                    BYTE* data = nullptr;
-                    UINT32 numFrames = 0;
-                    DWORD flags = 0;
+                    BYTE* data = nullptr; UINT32 numFrames = 0; DWORD flags = 0;
                     hr = captureClient->GetBuffer(&data, &numFrames, &flags, nullptr, nullptr);
                     if (FAILED(hr)) break;
-
                     UINT32 bytes = numFrames * 4;
-
                     if (m_buffer) {
-                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
-                            vector<BYTE> zeros(bytes, 0);
-                            m_buffer->Push(zeros.data(), bytes);
-                        }
-                        else {
-                            m_buffer->Push(data, bytes);
-                        }
+                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) { vector<BYTE> zeros(bytes, 0); m_buffer->Push(zeros.data(), bytes); }
+                        else m_buffer->Push(data, bytes);
                     }
                     else if (m_writer) {
                         ComPtr<IMFMediaBuffer> buf;
@@ -621,37 +533,29 @@ private:
                             if (SUCCEEDED(buf->Lock(&dst, nullptr, nullptr))) {
                                 if (flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(dst, 0, bytes);
                                 else memcpy(dst, data, bytes);
-                                buf->Unlock();
-                                buf->SetCurrentLength(bytes);
-
+                                buf->Unlock(); buf->SetCurrentLength(bytes);
                                 ComPtr<IMFSample> sample;
                                 if (SUCCEEDED(MFCreateSample(&sample))) {
                                     sample->AddBuffer(buf.Get());
-                                    LONGLONG ts = (samplePos * 10000000LL) / 48000;
-                                    LONGLONG dur = ((LONGLONG)numFrames * 10000000LL) / 48000;
-                                    sample->SetSampleTime(ts);
-                                    sample->SetSampleDuration(dur);
+                                    sample->SetSampleTime((samplePos * 10000000LL) / 48000);
+                                    sample->SetSampleDuration(((LONGLONG)numFrames * 10000000LL) / 48000);
                                     m_writer->WriteSample(m_streamIdx, sample.Get());
                                 }
                             }
                         }
                     }
-
                     samplePos += numFrames;
                     captureClient->ReleaseBuffer(numFrames);
                     hr = captureClient->GetNextPacketSize(&packetLength);
                 }
             }
-
             audioClient->Stop();
         } while (false);
-
         if (hEvent) CloseHandle(hEvent);
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (comHere) CoUninitialize();
         m_running.store(false);
     }
-
     thread m_thread;
     atomic<bool> m_stopFlag{ false };
     atomic<bool> m_running{ false };
@@ -667,88 +571,45 @@ class AudioMixer {
 public:
     bool Start(IMFSinkWriter* writer, DWORD streamIdx, bool useSys, const wstring& sysId, bool useMic, const wstring& micId) {
         if (m_running.load()) return false;
-        m_writer = writer;
-        m_streamIdx = streamIdx;
-        m_useSys = useSys;
-        m_useMic = useMic;
-        m_stopFlag.store(false);
-        m_paused.store(false);
-        m_lastError.clear();
-        m_sysBuf.Clear();
-        m_micBuf.Clear();
-
-        if (useSys) {
-            if (!m_sys.Start(nullptr, 0, sysId, &m_sysBuf)) {
-                m_lastError = "sys: " + m_sys.LastError();
-                return false;
-            }
-        }
-        if (useMic) {
-            if (!m_mic.Start(nullptr, 0, micId, &m_micBuf)) {
-                if (useSys) m_sys.Stop();
-                m_lastError = "mic: " + m_mic.LastError();
-                return false;
-            }
-        }
-
+        m_writer = writer; m_streamIdx = streamIdx;
+        m_useSys = useSys; m_useMic = useMic;
+        m_stopFlag.store(false); m_paused.store(false);
+        m_lastError.clear(); m_sysBuf.Clear(); m_micBuf.Clear();
+        if (useSys) if (!m_sys.Start(nullptr, 0, sysId, &m_sysBuf)) { m_lastError = "sys"; return false; }
+        if (useMic) if (!m_mic.Start(nullptr, 0, micId, &m_micBuf)) { if (useSys) m_sys.Stop(); m_lastError = "mic"; return false; }
         m_running.store(true);
-        try {
-            m_mixThread = thread(&AudioMixer::MixLoop, this);
-        }
-        catch (...) {
-            m_stopFlag.store(true);
-            m_sys.Stop();
-            m_mic.Stop();
-            m_running.store(false);
-            m_lastError = "falha ao criar thread de mixagem";
-            return false;
-        }
+        try { m_mixThread = thread(&AudioMixer::MixLoop, this); }
+        catch (...) { m_stopFlag.store(true); m_sys.Stop(); m_mic.Stop(); m_running.store(false); m_lastError = "thread"; return false; }
         return true;
     }
-
     void SetPaused(bool p) { m_paused.store(p); }
     void ClearBuffers() { m_sysBuf.Clear(); m_micBuf.Clear(); }
-
     void Stop() {
         if (!m_running.load()) return;
         m_stopFlag.store(true);
         if (m_mixThread.joinable()) m_mixThread.join();
-        m_sys.Stop();
-        m_mic.Stop();
+        m_sys.Stop(); m_mic.Stop();
         m_running.store(false);
     }
-
     bool IsRunning() const { return m_running.load(); }
     string LastError() const { return m_lastError; }
-
 private:
     void MixLoop() {
         CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         DWORD taskIndex = 0;
         HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
-
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
         const int FRAMES = 480;
         const int BYTES = FRAMES * 4;
-
-        vector<BYTE> sysChunk(BYTES);
-        vector<BYTE> micChunk(BYTES);
-        vector<BYTE> mixed(BYTES);
+        vector<BYTE> sysChunk(BYTES), micChunk(BYTES), mixed(BYTES);
         LONGLONG samplePos = 0;
-
         while (!m_stopFlag.load()) {
             if (m_paused.load()) { Sleep(10); continue; }
-
             bool sysReady = !m_useSys || m_sysBuf.Available() >= (size_t)BYTES;
             bool micReady = !m_useMic || m_micBuf.Available() >= (size_t)BYTES;
-
-            if (!sysReady || !micReady) {
-                Sleep(1);
-                continue;
-            }
-
+            if (!sysReady || !micReady) { Sleep(1); continue; }
             if (m_useSys) m_sysBuf.Pop(sysChunk.data(), BYTES);
             if (m_useMic) m_micBuf.Pop(micChunk.data(), BYTES);
-
             if (m_useSys && m_useMic) {
                 int16_t* a = (int16_t*)sysChunk.data();
                 int16_t* b = (int16_t*)micChunk.data();
@@ -760,52 +621,32 @@ private:
                     o[i] = (int16_t)v;
                 }
             }
-            else if (m_useSys) {
-                memcpy(mixed.data(), sysChunk.data(), BYTES);
-            }
-            else if (m_useMic) {
-                memcpy(mixed.data(), micChunk.data(), BYTES);
-            }
-            else {
-                Sleep(5);
-                continue;
-            }
-
+            else if (m_useSys) memcpy(mixed.data(), sysChunk.data(), BYTES);
+            else if (m_useMic) memcpy(mixed.data(), micChunk.data(), BYTES);
+            else { Sleep(5); continue; }
             ComPtr<IMFMediaBuffer> buf;
             if (FAILED(MFCreateMemoryBuffer(BYTES, &buf))) continue;
             BYTE* dst = nullptr;
             if (FAILED(buf->Lock(&dst, nullptr, nullptr))) continue;
             memcpy(dst, mixed.data(), BYTES);
-            buf->Unlock();
-            buf->SetCurrentLength(BYTES);
-
+            buf->Unlock(); buf->SetCurrentLength(BYTES);
             ComPtr<IMFSample> sample;
             if (FAILED(MFCreateSample(&sample))) continue;
             sample->AddBuffer(buf.Get());
-            LONGLONG ts = (samplePos * 10000000LL) / 48000;
-            LONGLONG dur = ((LONGLONG)FRAMES * 10000000LL) / 48000;
-            sample->SetSampleTime(ts);
-            sample->SetSampleDuration(dur);
+            sample->SetSampleTime((samplePos * 10000000LL) / 48000);
+            sample->SetSampleDuration(((LONGLONG)FRAMES * 10000000LL) / 48000);
             m_writer->WriteSample(m_streamIdx, sample.Get());
-
             samplePos += FRAMES;
         }
-
         if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         CoUninitialize();
     }
-
     IMFSinkWriter* m_writer = nullptr;
     DWORD m_streamIdx = 0;
-    bool m_useSys = false;
-    bool m_useMic = false;
-    atomic<bool> m_stopFlag{ false };
-    atomic<bool> m_running{ false };
-    atomic<bool> m_paused{ false };
-    AudioCapture m_sys{ false };
-    AudioCapture m_mic{ true };
-    AudioBuffer m_sysBuf;
-    AudioBuffer m_micBuf;
+    bool m_useSys = false, m_useMic = false;
+    atomic<bool> m_stopFlag{ false }, m_running{ false }, m_paused{ false };
+    AudioCapture m_sys{ false }, m_mic{ true };
+    AudioBuffer m_sysBuf, m_micBuf;
     thread m_mixThread;
     string m_lastError;
 };
@@ -820,7 +661,7 @@ public:
         m_startTime = chrono::steady_clock::now();
         m_running.store(true);
         try { m_thread = thread(&ScreenRecorder::RecordLoop, this, cfg); }
-        catch (...) { m_running.store(false); m_lastError = "falha ao criar a thread de gravacao"; return false; }
+        catch (...) { m_running.store(false); m_lastError = "falha thread"; return false; }
         return true;
     }
     void Stop() {
@@ -837,7 +678,37 @@ public:
     const string& LastError() const { return m_lastError; }
 
 private:
-    static const int RING = 32;
+    static const int RING = 8;
+
+    struct EncodeQueue {
+        mutex mtx;
+        condition_variable cv;
+        int slots[RING];
+        int head = 0, tail = 0, count = 0;
+
+        bool PushIfRoom(int s) {
+            lock_guard<mutex> lk(mtx);
+            if (count == RING) return false;
+            slots[tail] = s;
+            tail = (tail + 1) % RING;
+            count++;
+            cv.notify_one();
+            return true;
+        }
+        bool IsFull() {
+            lock_guard<mutex> lk(mtx);
+            return count == RING;
+        }
+        bool Pop(int& s, int timeoutMs) {
+            unique_lock<mutex> lk(mtx);
+            if (!cv.wait_for(lk, chrono::milliseconds(timeoutMs), [&] { return count > 0; })) return false;
+            s = slots[head];
+            head = (head + 1) % RING;
+            count--;
+            return true;
+        }
+    };
+    EncodeQueue m_queue;
 
     void RecordLoop(Config cfg) {
         HRESULT hr = S_OK;
@@ -876,23 +747,27 @@ private:
         LARGE_INTEGER qpf{}, t0{}, now{};
         UINT texW = 0, texH = 0, outW = 0, outH = 0, stageIdx = 0;
         UINT incomingW = 0, incomingH = 0;
-        bool haveNew = false, wroteAny = false, comHere = false, mfHere = false;
+        bool comHere = false, mfHere = false;
         bool framePending = false;
         DWORD videoStreamIdx = 0;
         DWORD audioStreamIdx = 0;
         bool useSysAudio = false;
         bool useMic = false;
-        UINT64 writeCount = 0;
         double frameDurHns = 0.0;
         DXGI_OUTDUPL_DESC dupDesc{};
         string curFile = cfg.outputFile;
         HWND targetHwnd = nullptr;
         bool windowMode = (cfg.captureMode == 1);
         chrono::steady_clock::time_point lastDuplAttempt = chrono::steady_clock::now() - chrono::seconds(10);
-        chrono::steady_clock::time_point lastFrameArrival = chrono::steady_clock::now();
         bool paused = false;
         chrono::steady_clock::time_point pauseStart;
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        double nextWriteHns = 0.0;
+        atomic<bool> encoderDone{ false };
+        atomic<bool> wroteAny{ false };
+
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_TIME_CRITICAL);
+        DWORD mmcssIdx = 0;
+        HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Capture", &mmcssIdx);
 
         auto CreateCaptureTextures = [&](UINT capW, UINT capH, UINT oW, UINT oH) -> HRESULT {
             HRESULT r = S_OK;
@@ -937,8 +812,7 @@ private:
             };
 
         auto AddAacStream = [&](IMFSinkWriter* w, DWORD* outIdx) -> bool {
-            ComPtr<IMFMediaType> ao;
-            MFCreateMediaType(&ao);
+            ComPtr<IMFMediaType> ao; MFCreateMediaType(&ao);
             ao->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
             ao->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
             ao->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
@@ -948,8 +822,7 @@ private:
             ao->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
             DWORD idx = 0;
             if (FAILED(w->AddStream(ao.Get(), &idx))) return false;
-            ComPtr<IMFMediaType> ai;
-            MFCreateMediaType(&ai);
+            ComPtr<IMFMediaType> ai; MFCreateMediaType(&ai);
             ai->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
             ai->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
             ai->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
@@ -968,7 +841,6 @@ private:
             MFCreateAttributes(&at, 4);
             at->SetUINT32(MF_READWRITE_ENABLE_HARDWARE_TRANSFORMS, TRUE);
             at->SetUINT32(MF_SINK_WRITER_DISABLE_THROTTLING, TRUE);
-            at->SetUINT32(MF_LOW_LATENCY, TRUE);
             at->SetUnknown(MF_SINK_WRITER_D3D_MANAGER, dxgiMan.Get());
             ComPtr<IMFSinkWriter> w;
             HRESULT r = MFCreateSinkWriterFromURL(file.c_str(), nullptr, at.Get(), &w);
@@ -978,7 +850,7 @@ private:
             MFCreateMediaType(&ot);
             ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
             if (cfg.format == "wmv") ot->SetGUID(MF_MT_SUBTYPE, kGuidVideoWMV3);
-            else { ot->SetGUID(MF_MT_SUBTYPE, kGuidSubtypeH264); ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_High); }
+            else { ot->SetGUID(MF_MT_SUBTYPE, kGuidSubtypeH264); ot->SetUINT32(MF_MT_MPEG2_PROFILE, eAVEncH264VProfile_Main); }
             ot->SetUINT32(MF_MT_AVG_BITRATE, (UINT32)cfg.bitrateKbps * 1000);
             ot->SetUINT32(MF_MT_INTERLACE_MODE, MFVideoInterlace_Progressive);
             MFSetAttributeSize(ot.Get(), MF_MT_FRAME_SIZE, outW, outH);
@@ -1001,9 +873,7 @@ private:
             if (FAILED(r)) return r;
 
             audioStreamIdx = 0;
-            if (useSysAudio || useMic) {
-                if (!AddAacStream(w.Get(), &audioStreamIdx)) audioStreamIdx = 0;
-            }
+            if (useSysAudio || useMic) if (!AddAacStream(w.Get(), &audioStreamIdx)) audioStreamIdx = 0;
 
             r = w->BeginWriting();
             if (FAILED(r)) return r;
@@ -1011,105 +881,56 @@ private:
             return S_OK;
             };
 
-        auto WriteFrame = [&](double ts) -> HRESULT {
-            wIdx = (wIdx + 1) % RING;
-            bool wrote = false;
-
-            LONG srcW = (LONG)min(incomingW, texW);
-            LONG srcH = (LONG)min(incomingH, texH);
-            if (srcW <= 0 || srcH <= 0) return S_OK;
-
-            if (windowMode && targetHwnd && IsWindow(targetHwnd) && !IsIconic(targetHwnd)) {
-                RECT cr{};
-                GetClientRect(targetHwnd, &cr);
-                POINT tl = { 0, 0 };
-                ClientToScreen(targetHwnd, &tl);
-                LONG lx = tl.x - orgX;
-                LONG ly = tl.y - orgY;
-                LONG lw = cr.right - cr.left;
-                LONG lh = cr.bottom - cr.top;
-                if (lx < 0) { lw += lx; lx = 0; }
-                if (ly < 0) { lh += ly; ly = 0; }
-                if (lx + lw > srcW) lw = srcW - lx;
-                if (ly + lh > srcH) lh = srcH - ly;
-
-                if (lw > 0 && lh > 0 && d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
-                    d2dCtx->SetTarget(frameBmp[wIdx].Get());
-                    d2dCtx->BeginDraw();
-                    d2dCtx->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-                    D2D1_RECT_F srcRect = D2D1::RectF((float)lx, (float)ly, (float)(lx + lw), (float)(ly + lh));
-                    D2D1_RECT_F dstRect = D2D1::RectF(0, 0, (float)outW, (float)outH);
-                    d2dCtx->DrawBitmap(stagingBmp[stageIdx].Get(), &dstRect, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, &srcRect);
-                    if (cfg.showCursor && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get()) {
-                        float scaleX = (float)outW / (float)lw;
-                        float scaleY = (float)outH / (float)lh;
-                        float dx = (float)(cursorX - orgX - lx - dcur.hx) * scaleX;
-                        float dy = (float)(cursorY - orgY - ly - dcur.hy) * scaleY;
-                        float dw = (float)dcur.w * scaleX;
-                        float dh = (float)dcur.h * scaleY;
-                        D2D1_RECT_F dr = D2D1::RectF(dx, dy, dx + dw, dy + dh);
-                        d2dCtx->DrawBitmap(curBmp.Get(), &dr);
-                    }
-                    HRESULT hd = d2dCtx->EndDraw();
-                    if (FAILED(hd)) { d2dCtx.Reset(); d2dDevice.Reset(); d2dFactory.Reset(); curBmp.Reset(); d2dOk = false; }
-                    wrote = true;
+        auto encodeThreadFn = [&]() {
+            CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+            SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_HIGHEST);
+            double lastTs = -1.0;
+            while (!m_stopFlag.load() || !encoderDone.load()) {
+                int slot = -1;
+                if (!m_queue.Pop(slot, 50)) {
+                    if (m_stopFlag.load() && encoderDone.load()) break;
+                    continue;
                 }
-            }
-            else if (!windowMode) {
-                if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
-                    d2dCtx->SetTarget(frameBmp[wIdx].Get());
-                    d2dCtx->BeginDraw();
-                    d2dCtx->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
-                    D2D1_RECT_F srcRect = D2D1::RectF(0, 0, (float)srcW, (float)srcH);
-                    D2D1_RECT_F dstRect = D2D1::RectF(0, 0, (float)outW, (float)outH);
-                    d2dCtx->DrawBitmap(stagingBmp[stageIdx].Get(), &dstRect, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, &srcRect);
-                    if (cfg.showCursor && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get()) {
-                        float scaleX = (float)outW / (float)srcW;
-                        float scaleY = (float)outH / (float)srcH;
-                        float dx = (float)(cursorX - orgX - dcur.hx) * scaleX;
-                        float dy = (float)(cursorY - orgY - dcur.hy) * scaleY;
-                        float dw = (float)dcur.w * scaleX;
-                        float dh = (float)dcur.h * scaleY;
-                        D2D1_RECT_F dr = D2D1::RectF(dx, dy, dx + dw, dy + dh);
-                        d2dCtx->DrawBitmap(curBmp.Get(), &dr);
-                    }
-                    HRESULT hd = d2dCtx->EndDraw();
-                    if (FAILED(hd)) { d2dCtx.Reset(); d2dDevice.Reset(); d2dFactory.Reset(); curBmp.Reset(); d2dOk = false; }
-                }
-                else {
-                    ctx->CopyResource(wtex[wIdx].Get(), staging[stageIdx].Get());
-                }
-                wrote = true;
-            }
+                if (slot < 0 || slot >= RING) continue;
+                if (!wtex[slot].Get() || !writer.Get()) continue;
 
-            if (!wrote) return S_OK;
+                QueryPerformanceCounter(&now);
+                double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
+                double ts = nowHns;
+                if (ts <= lastTs) ts = lastTs + 1.0;
+                lastTs = ts;
 
-            ComPtr<IMFMediaBuffer> outBuf;
-            if (FAILED(MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), wtex[wIdx].Get(), 0, FALSE, &outBuf))) return E_FAIL;
-            IMF2DBuffer* p2d = nullptr;
-            if (SUCCEEDED(outBuf->QueryInterface(__uuidof(IMF2DBuffer), (void**)&p2d))) {
-                DWORD c2 = 0;
-                if (SUCCEEDED(p2d->GetContiguousLength(&c2))) outBuf->SetCurrentLength(c2);
-                p2d->Release();
+                ComPtr<IMFMediaBuffer> outBuf;
+                HRESULT rr = MFCreateDXGISurfaceBuffer(__uuidof(ID3D11Texture2D), wtex[slot].Get(), 0, FALSE, &outBuf);
+                if (FAILED(rr)) continue;
+                IMF2DBuffer* p2d = nullptr;
+                if (SUCCEEDED(outBuf->QueryInterface(__uuidof(IMF2DBuffer), (void**)&p2d))) {
+                    DWORD c2 = 0;
+                    if (SUCCEEDED(p2d->GetContiguousLength(&c2))) outBuf->SetCurrentLength(c2);
+                    p2d->Release();
+                }
+                ComPtr<IMFSample> s;
+                if (FAILED(MFCreateSample(&s))) continue;
+                if (FAILED(s->AddBuffer(outBuf.Get()))) continue;
+                s->SetSampleTime((LONGLONG)ts);
+                s->SetSampleDuration((LONGLONG)frameDurHns);
+                writer->WriteSample(videoStreamIdx, s.Get());
+                wroteAny.store(true);
             }
-            ComPtr<IMFSample> s;
-            if (FAILED(MFCreateSample(&s))) return E_FAIL;
-            if (FAILED(s->AddBuffer(outBuf.Get()))) return E_FAIL;
-            if (FAILED(s->SetSampleTime((LONGLONG)ts))) return E_FAIL;
-            if (FAILED(s->SetSampleDuration((LONGLONG)frameDurHns))) return E_FAIL;
-            return writer->WriteSample(videoStreamIdx, s.Get());
+            CoUninitialize();
             };
 
         if (windowMode) {
             targetHwnd = FindWindowByTitle(cfg.windowTitle);
-            if (!targetHwnd) { err = "janela alvo nao encontrada"; goto cleanup; }
+            if (!targetHwnd) { err = "janela nao encontrada"; goto cleanup; }
         }
 
         hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (SUCCEEDED(hr)) comHere = true;
         hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
-        if (FAILED(hr)) { err = "MFStartup falhou"; failHR = (DWORD)hr; goto cleanup; }
+        if (FAILED(hr)) { err = "MFStartup falhou"; goto cleanup; }
         mfHere = true;
+
         useSysAudio = cfg.audioEnabled && ProbeDefaultEndpoint(eRender);
         useMic = cfg.micEnabled && ProbeDefaultEndpoint(eCapture);
         QueryPerformanceFrequency(&qpf);
@@ -1118,32 +939,24 @@ private:
             D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
             D3D_FEATURE_LEVEL got{};
             hr = D3D11CreateDevice(nullptr, D3D_DRIVER_TYPE_HARDWARE, nullptr, devFlags, levels, ARRAYSIZE(levels), D3D11_SDK_VERSION, &d3dDev, &got, &ctx);
-            if (FAILED(hr)) { err = "D3D11CreateDevice falhou"; failHR = (DWORD)hr; goto cleanup; }
+            if (FAILED(hr)) { err = "D3D11CreateDevice"; goto cleanup; }
         }
-        hr = ctx->QueryInterface(__uuidof(ID3D10Multithread), (void**)&mt);
-        if (SUCCEEDED(hr)) mt->SetMultithreadProtected(TRUE);
-        hr = d3dDev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev);
-        if (FAILED(hr)) { err = "IDXGIDevice"; failHR = (DWORD)hr; goto cleanup; }
+        if (SUCCEEDED(ctx->QueryInterface(__uuidof(ID3D10Multithread), (void**)&mt))) mt->SetMultithreadProtected(TRUE);
+        if (FAILED(d3dDev->QueryInterface(__uuidof(IDXGIDevice), (void**)&dxgiDev))) { err = "IDXGIDevice"; goto cleanup; }
         dxgiDev->GetAdapter(&adapter);
-        hr = adapter->EnumOutputs((UINT)cfg.monitor, &output);
-        if (FAILED(hr)) { err = "monitor invalido"; failHR = (DWORD)hr; goto cleanup; }
-        hr = output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1);
-        if (FAILED(hr)) { err = "IDXGIOutput1"; failHR = (DWORD)hr; goto cleanup; }
-        hr = output1->DuplicateOutput(d3dDev.Get(), &dupl);
-        if (FAILED(hr)) { err = "DuplicateOutput falhou"; failHR = (DWORD)hr; goto cleanup; }
+        if (FAILED(adapter->EnumOutputs((UINT)cfg.monitor, &output))) { err = "monitor invalido"; goto cleanup; }
+        if (FAILED(output->QueryInterface(__uuidof(IDXGIOutput1), (void**)&output1))) { err = "Output1"; goto cleanup; }
+        if (FAILED(output1->DuplicateOutput(d3dDev.Get(), &dupl))) { err = "DuplicateOutput"; goto cleanup; }
         dupl->GetDesc(&dupDesc);
-        texW = dupDesc.ModeDesc.Width;
-        texH = dupDesc.ModeDesc.Height;
+        texW = dupDesc.ModeDesc.Width; texH = dupDesc.ModeDesc.Height;
         incomingW = texW; incomingH = texH;
-        if (texW == 0 || texH == 0) { err = "resolucao do desktop invalida"; goto cleanup; }
+        if (texW == 0 || texH == 0) { err = "resolucao invalida"; goto cleanup; }
         {
             DXGI_OUTPUT_DESC od{};
             if (SUCCEEDED(output->GetDesc(&od))) { orgX = od.DesktopCoordinates.left; orgY = od.DesktopCoordinates.top; }
         }
-
         if (windowMode) {
-            RECT cr{};
-            GetClientRect(targetHwnd, &cr);
+            RECT cr{}; GetClientRect(targetHwnd, &cr);
             UINT wcw = (UINT)((cr.right - cr.left) & ~1);
             UINT wch = (UINT)((cr.bottom - cr.top) & ~1);
             if (wcw >= 64 && wch >= 64) { outW = wcw; outH = wch; }
@@ -1158,10 +971,8 @@ private:
 
         {
             UINT resetToken = 0;
-            hr = MFCreateDXGIDeviceManager(&resetToken, &dxgiMan);
-            if (FAILED(hr)) { err = "MFCreateDXGIDeviceManager"; failHR = (DWORD)hr; goto cleanup; }
-            hr = dxgiMan->ResetDevice(d3dDev.Get(), resetToken);
-            if (FAILED(hr)) { err = "ResetDevice"; failHR = (DWORD)hr; goto cleanup; }
+            if (FAILED(MFCreateDXGIDeviceManager(&resetToken, &dxgiMan))) { err = "DXGIMan"; goto cleanup; }
+            if (FAILED(dxgiMan->ResetDevice(d3dDev.Get(), resetToken))) { err = "ResetDevice"; goto cleanup; }
         }
         do {
             if (FAILED(D2D1CreateFactory(D2D1_FACTORY_TYPE_SINGLE_THREADED, __uuidof(ID2D1Factory1), (void**)&d2dFactory))) break;
@@ -1171,26 +982,37 @@ private:
         } while (false);
 
         hr = CreateCaptureTextures(texW, texH, outW, outH);
-        if (FAILED(hr)) { err = "CreateTexture2D"; failHR = (DWORD)hr; goto cleanup; }
-        if (!d2dOk && cfg.showCursor) cout << "\n cursor: falha ao iniciar composicao - gravando sem cursor\n";
+        if (FAILED(hr)) { err = "CreateTexture2D"; goto cleanup; }
+        if (!d2dOk && cfg.showCursor) cout << "\n cursor: falha - gravando sem cursor\n";
 
         hr = CreateVideoWriter(Utf8ToWide(curFile));
-        if (FAILED(hr)) { err = "nao foi possivel iniciar o encoder"; failHR = (DWORD)hr; goto cleanup; }
+        if (FAILED(hr)) { err = "encoder nao iniciou"; goto cleanup; }
 
         if ((useSysAudio || useMic) && audioStreamIdx > 0) {
             if (!m_mixer.Start(writer.Get(), audioStreamIdx, useSysAudio, L"", useMic, cfg.micId)) {
-                cout << "\n mixer de audio: falha (" << m_mixer.LastError() << ") - continuando sem audio\n";
+                cout << "\n mixer: falha - sem audio\n";
                 useSysAudio = false; useMic = false; audioStreamIdx = 0;
             }
         }
 
         QueryPerformanceCounter(&t0);
         frameDurHns = 10'000'000.0 / (double)cfg.fps;
-        lastFrameArrival = chrono::steady_clock::now();
+        nextWriteHns = 0.0;
+
+        {
+            thread encTh(encodeThreadFn);
+            encTh.detach();
+        }
 
         while (!m_stopFlag.load()) {
+            {
+                LARGE_INTEGER target;
+                target.QuadPart = t0.QuadPart + (LONGLONG)(nextWriteHns * (double)qpf.QuadPart / 10'000'000.0);
+                SleepUntilQpc(target, qpf);
+            }
+            if (m_stopFlag.load()) break;
+
             auto nowSteady = chrono::steady_clock::now();
-            bool gotNewFrame = false;
 
             if (!dupl.Get()) {
                 if (framePending) framePending = false;
@@ -1206,26 +1028,51 @@ private:
                         cursorInit = false;
                     }
                 }
+                if (!dupl.Get()) {
+                    if (!paused) {
+                        paused = true;
+                        pauseStart = nowSteady;
+                        m_mixer.SetPaused(true);
+                    }
+                    QueryPerformanceCounter(&now);
+                    double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
+                    nextWriteHns = nowHns + frameDurHns;
+                    continue;
+                }
+                else if (paused) {
+                    auto pauseNs = chrono::duration_cast<chrono::nanoseconds>(nowSteady - pauseStart).count();
+                    t0.QuadPart += (LONGLONG)((double)pauseNs * (double)qpf.QuadPart / 1.0e9);
+                    paused = false;
+                    m_mixer.ClearBuffers();
+                    m_mixer.SetPaused(false);
+                    QueryPerformanceCounter(&now);
+                    double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
+                    nextWriteHns = nowHns;
+                }
+            }
+
+            if (paused) {
+                QueryPerformanceCounter(&now);
+                double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
+                nextWriteHns = nowHns + frameDurHns;
+                continue;
             }
 
             if (dupl.Get()) {
-                hr = dupl->AcquireNextFrame(1, &frameInfo, &res);
+                hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
                 if (hr == S_OK) {
                     framePending = true;
                     if (d2dOk && cfg.showCursor) {
-                        bool timeChanged = (frameInfo.LastMouseUpdateTime.QuadPart != lastMouseStamp);
-                        bool posChanged = (frameInfo.PointerPosition.Position.x != cursorX) ||
-                            (frameInfo.PointerPosition.Position.y != cursorY);
-                        bool visChanged = ((frameInfo.PointerPosition.Visible != FALSE) != cursorVisible);
-                        if (timeChanged || posChanged || visChanged) {
-                            if (timeChanged) lastMouseStamp = frameInfo.LastMouseUpdateTime.QuadPart;
-                            CURSORINFO ci{};
-                            ci.cbSize = sizeof(CURSORINFO);
-                            bool win32Visible = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor;
-                            bool dxgiVisible = frameInfo.PointerPosition.Visible != FALSE;
-                            if (win32Visible && dxgiVisible) {
-                                cursorInit = true;
-                                cursorVisible = true;
+                        bool tc = (frameInfo.LastMouseUpdateTime.QuadPart != lastMouseStamp);
+                        bool pc = (frameInfo.PointerPosition.Position.x != cursorX) || (frameInfo.PointerPosition.Position.y != cursorY);
+                        bool vc = ((frameInfo.PointerPosition.Visible != FALSE) != cursorVisible);
+                        if (tc || pc || vc) {
+                            if (tc) lastMouseStamp = frameInfo.LastMouseUpdateTime.QuadPart;
+                            CURSORINFO ci{}; ci.cbSize = sizeof(CURSORINFO);
+                            bool wv = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor;
+                            bool dv = frameInfo.PointerPosition.Visible != FALSE;
+                            if (wv && dv) {
+                                cursorInit = true; cursorVisible = true;
                                 cursorX = frameInfo.PointerPosition.Position.x;
                                 cursorY = frameInfo.PointerPosition.Position.y;
                                 if (ci.hCursor != lastCur) {
@@ -1239,9 +1086,7 @@ private:
                                     }
                                 }
                             }
-                            else if (!win32Visible && !dxgiVisible) {
-                                cursorVisible = false;
-                            }
+                            else if (!wv && !dv) cursorVisible = false;
                         }
                     }
 
@@ -1253,7 +1098,6 @@ private:
                         frameTex->GetDesc(&fdesc);
                         incomingW = fdesc.Width;
                         incomingH = fdesc.Height;
-
                         if (incomingW == texW && incomingH == texH) {
                             ctx->CopyResource(staging[stageIdx].Get(), frameTex.Get());
                         }
@@ -1272,9 +1116,6 @@ private:
                     res.Reset();
                     dupl->ReleaseFrame();
                     framePending = false;
-                    haveNew = true;
-                    gotNewFrame = true;
-                    lastFrameArrival = nowSteady;
                 }
                 else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
                 }
@@ -1284,80 +1125,135 @@ private:
                 }
                 else {
                     if (framePending && dupl.Get()) { dupl->ReleaseFrame(); framePending = false; }
-                    err = "AcquireNextFrame falhou";
-                    failHR = (DWORD)hr;
-                    goto cleanup;
+                    err = "AcquireNextFrame falhou"; failHR = (DWORD)hr; goto cleanup;
                 }
             }
 
-            if (gotNewFrame) {
-                if (paused) {
-                    auto pauseNs = chrono::duration_cast<chrono::nanoseconds>(nowSteady - pauseStart).count();
-                    LONGLONG qpcShift = (LONGLONG)((double)pauseNs * (double)qpf.QuadPart / 1.0e9);
-                    t0.QuadPart += qpcShift;
-                    paused = false;
-                    m_mixer.ClearBuffers();
-                    m_mixer.SetPaused(false);
-                }
+            // slot que vai usar
+            UINT tryIdx = (wIdx + 1) % RING;
+            bool slotOk = true;
+            {
+                // verifica se já está na fila
+                // (o consumer libra após WriteSample, não temos um check direto)
             }
-            else {
-                auto sinceArrival = chrono::duration_cast<chrono::milliseconds>(nowSteady - lastFrameArrival).count();
-                if (sinceArrival > 500 && !paused) {
-                    paused = true;
-                    pauseStart = nowSteady;
-                    m_mixer.SetPaused(true);
-                }
-            }
+            // tenta enfileirar
+            // faz a composição no slot tryIdx e depois enfileira
+            wIdx = tryIdx;
 
-            if (paused) {
-                Sleep(10);
+            LONG srcW = (LONG)min(incomingW, texW);
+            LONG srcH = (LONG)min(incomingH, texH);
+            if (srcW <= 0 || srcH <= 0) {
+                QueryPerformanceCounter(&now);
+                double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
+                nextWriteHns = nowHns + frameDurHns;
                 continue;
             }
 
-            if (!wroteAny && !haveNew) {
-                Sleep(2);
-                continue;
+            bool wrote = false;
+
+            if (windowMode && targetHwnd && IsWindow(targetHwnd) && !IsIconic(targetHwnd)) {
+                RECT cr{}; GetClientRect(targetHwnd, &cr);
+                POINT tl = { 0, 0 }; ClientToScreen(targetHwnd, &tl);
+                LONG lx = tl.x - orgX, ly = tl.y - orgY;
+                LONG lw = cr.right - cr.left, lh = cr.bottom - cr.top;
+                if (lx < 0) { lw += lx; lx = 0; }
+                if (ly < 0) { lh += ly; ly = 0; }
+                if (lx + lw > srcW) lw = srcW - lx;
+                if (ly + lh > srcH) lh = srcH - ly;
+
+                if (lw > 0 && lh > 0) {
+                    if ((UINT)lw == outW && (UINT)lh == outH) {
+                        // FAST PATH: crop direto via D3D11, sem D2D
+                        D3D11_BOX box = {};
+                        box.left = (UINT)lx; box.top = (UINT)ly; box.front = 0;
+                        box.right = (UINT)(lx + lw); box.bottom = (UINT)(ly + lh); box.back = 1;
+                        ctx->CopySubresourceRegion(wtex[wIdx].Get(), 0, 0, 0, 0, staging[stageIdx].Get(), 0, &box);
+
+                        // cursor overlay se necessário
+                        if (cfg.showCursor && d2dOk && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get() && frameBmp[wIdx].Get()) {
+                            d2dCtx->SetTarget(frameBmp[wIdx].Get());
+                            d2dCtx->BeginDraw();
+                            float dx = (float)(cursorX - orgX - lx - dcur.hx);
+                            float dy = (float)(cursorY - orgY - ly - dcur.hy);
+                            D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w, dy + (float)dcur.h);
+                            d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                            d2dCtx->EndDraw();
+                        }
+                        wrote = true;
+                    }
+                    else if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
+                        d2dCtx->SetTarget(frameBmp[wIdx].Get());
+                        d2dCtx->BeginDraw();
+                        D2D1_RECT_F sr = D2D1::RectF((float)lx, (float)ly, (float)(lx + lw), (float)(ly + lh));
+                        D2D1_RECT_F dr = D2D1::RectF(0, 0, (float)outW, (float)outH);
+                        d2dCtx->DrawBitmap(stagingBmp[stageIdx].Get(), &dr, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, &sr);
+                        if (cfg.showCursor && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get()) {
+                            float sx = (float)outW / (float)lw, sy = (float)outH / (float)lh;
+                            float dx = (float)(cursorX - orgX - lx - dcur.hx) * sx;
+                            float dy = (float)(cursorY - orgY - ly - dcur.hy) * sy;
+                            D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w * sx, dy + (float)dcur.h * sy);
+                            d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                        }
+                        d2dCtx->EndDraw();
+                        wrote = true;
+                    }
+                }
+            }
+            else if (!windowMode) {
+                if (outW == texW && outH == texH) {
+                    // FAST PATH: copy direto, sem D2D
+                    ctx->CopyResource(wtex[wIdx].Get(), staging[stageIdx].Get());
+                    if (cfg.showCursor && d2dOk && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get() && frameBmp[wIdx].Get()) {
+                        d2dCtx->SetTarget(frameBmp[wIdx].Get());
+                        d2dCtx->BeginDraw();
+                        float dx = (float)(cursorX - orgX - dcur.hx);
+                        float dy = (float)(cursorY - orgY - dcur.hy);
+                        D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w, dy + (float)dcur.h);
+                        d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                        d2dCtx->EndDraw();
+                    }
+                    wrote = true;
+                }
+                else if (d2dOk && stagingBmp[stageIdx].Get() && frameBmp[wIdx].Get()) {
+                    d2dCtx->SetTarget(frameBmp[wIdx].Get());
+                    d2dCtx->BeginDraw();
+                    D2D1_RECT_F sr = D2D1::RectF(0, 0, (float)srcW, (float)srcH);
+                    D2D1_RECT_F dr = D2D1::RectF(0, 0, (float)outW, (float)outH);
+                    d2dCtx->DrawBitmap(stagingBmp[stageIdx].Get(), &dr, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, &sr);
+                    if (cfg.showCursor && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get()) {
+                        float sx = (float)outW / (float)srcW, sy = (float)outH / (float)srcH;
+                        float dx = (float)(cursorX - orgX - dcur.hx) * sx;
+                        float dy = (float)(cursorY - orgY - dcur.hy) * sy;
+                        D2D1_RECT_F cdr = D2D1::RectF(dx, dy, dx + (float)dcur.w * sx, dy + (float)dcur.h * sy);
+                        d2dCtx->DrawBitmap(curBmp.Get(), &cdr, 1.0f, D2D1_INTERPOLATION_MODE_NEAREST_NEIGHBOR);
+                    }
+                    d2dCtx->EndDraw();
+                    wrote = true;
+                }
+                else {
+                    ctx->CopyResource(wtex[wIdx].Get(), staging[stageIdx].Get());
+                    wrote = true;
+                }
+            }
+
+            if (wrote) {
+                if (!m_queue.PushIfRoom((int)wIdx)) {
+                    // fila cheia: frame descartado (encoder atrasado)
+                }
             }
 
             QueryPerformanceCounter(&now);
-            double elapsedHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
-
-            UINT64 targetIdx = (UINT64)(elapsedHns / frameDurHns);
-            if (targetIdx > writeCount + 3) {
-                writeCount = targetIdx;
-            }
-
-            double dueTs = (double)writeCount * frameDurHns;
-            if (elapsedHns >= dueTs && (haveNew || wroteAny)) {
-                hr = WriteFrame(dueTs);
-                if (FAILED(hr)) {
-                    if (!wroteAny) {
-                        cout << "\n encoder recusou - abortando\n";
-                    }
-                    err = "WriteSample";
-                    failHR = (DWORD)hr;
-                    goto cleanup;
-                }
-                wroteAny = true;
-                writeCount++;
-                haveNew = false;
-            }
-
-            double nextDue = (double)writeCount * frameDurHns;
-            if (nextDue > elapsedHns) {
-                LARGE_INTEGER target;
-                target.QuadPart = t0.QuadPart + (LONGLONG)(nextDue * (double)qpf.QuadPart / 10'000'000.0);
-                SleepUntilQpc(target, qpf);
-            }
-            else {
-                Sleep(1);
-            }
+            double nowHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
+            nextWriteHns = nowHns + frameDurHns;
         }
 
     cleanup:
+        encoderDone.store(true);
+        m_queue.cv.notify_all();
+        Sleep(300);
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
         if (m_mixer.IsRunning()) m_mixer.Stop();
-        if (!wroteAny) {
-            if (err.empty()) err = "nenhum frame capturado";
+        if (!wroteAny.load()) {
             writer.Reset();
             DeleteFileW(Utf8ToWide(curFile).c_str());
         }
@@ -1370,9 +1266,7 @@ private:
         for (int i = 0; i < RING; i++) { staging[i].Reset(); stagingBmp[i].Reset(); }
         for (int i = 0; i < RING; i++) { frameBmp[i].Reset(); wtex[i].Reset(); }
         curBmp.Reset();
-        d2dCtx.Reset();
-        d2dDevice.Reset();
-        d2dFactory.Reset();
+        d2dCtx.Reset(); d2dDevice.Reset(); d2dFactory.Reset();
         dupl.Reset(); output1.Reset(); output.Reset(); adapter.Reset(); dxgiDev.Reset();
         mt.Reset(); ctx.Reset(); d3dDev.Reset();
         if (mfHere) MFShutdown();
@@ -1452,80 +1346,48 @@ static void RecordingScreen() {
 void startrecord() {
     if (g_recorder.IsRecording()) { MessageScreen("Recording is already running.", kAccent); return; }
     if (g_cfg.captureMode == 1) {
-        if (g_cfg.windowTitle.empty()) {
-            MessageScreen("Nenhuma janela selecionada. Va em Configuracao -> Capture Target.", kErr);
-            return;
-        }
+        if (g_cfg.windowTitle.empty()) { MessageScreen("Nenhuma janela selecionada.", kErr); return; }
         HWND h = FindWindowByTitle(g_cfg.windowTitle);
-        if (!h) {
-            MessageScreen("Janela nao encontrada: " + WideToUtf8(g_cfg.windowTitle), kErr);
-            return;
-        }
+        if (!h) { MessageScreen("Janela nao encontrada.", kErr); return; }
     }
     else {
         vector<MonitorInfo> mons = ListMonitors();
-        if (g_cfg.monitor < 0 || g_cfg.monitor >= (int)mons.size()) {
-            MessageScreen("Monitor invalido: " + to_string(g_cfg.monitor) + ". Configure em Open Configuration.", kErr);
-            return;
-        }
+        if (g_cfg.monitor < 0 || g_cfg.monitor >= (int)mons.size()) { MessageScreen("Monitor invalido.", kErr); return; }
     }
     g_cfg.outputFile = MakeAutoFilename(g_cfg.format);
-    if (!g_recorder.Start(g_cfg)) { MessageScreen("Nao foi possivel iniciar: " + g_recorder.LastError(), kErr); return; }
+    if (!g_recorder.Start(g_cfg)) { MessageScreen("Nao foi possivel iniciar.", kErr); return; }
     RecordingScreen();
 }
-static void ConfigEditFps() {
-    int v;
-    if (ReadIntConsole("FPS", "Frames por segundo", g_cfg.fps, 5, 240, v) && v != g_cfg.fps) { g_cfg.fps = v; SaveConfig(); }
-}
-static void ConfigEditBitrate() {
-    int v;
-    if (ReadIntConsole("BITRATE", "Bitrate de video em kbps", g_cfg.bitrateKbps, 500, 200000, v) && v != g_cfg.bitrateKbps) { g_cfg.bitrateKbps = v; SaveConfig(); }
-}
+static void ConfigEditFps() { int v; if (ReadIntConsole("FPS", "Frames por segundo", g_cfg.fps, 5, 240, v) && v != g_cfg.fps) { g_cfg.fps = v; SaveConfig(); } }
+static void ConfigEditBitrate() { int v; if (ReadIntConsole("BITRATE", "Bitrate (kbps)", g_cfg.bitrateKbps, 500, 200000, v) && v != g_cfg.bitrateKbps) { g_cfg.bitrateKbps = v; SaveConfig(); } }
 static void ConfigPickMonitor() {
     vector<MonitorInfo> mons = ListMonitors();
-    if (mons.empty()) { MessageScreen("Nenhum monitor detectado.", kErr); return; }
+    if (mons.empty()) { MessageScreen("Nenhum monitor.", kErr); return; }
     vector<string> items;
     for (size_t i = 0; i < mons.size(); i++) items.push_back("Monitor " + to_string(i) + "  -  " + mons[i].nameUtf8);
-    int r = SelectFromList("SELECIONE O MONITOR", items, g_cfg.monitor);
+    int r = SelectFromList("MONITOR", items, g_cfg.monitor);
     if (r >= 0 && r != g_cfg.monitor) { g_cfg.monitor = r; SaveConfig(); }
 }
 static void ConfigCustomResolution() {
-    string wd, ht;
-    bool phaseH = false, err = false;
+    string wd, ht; bool ph = false, e = false;
     while (true) {
         ClearScreen();
-        SetColor(kTitle); cout << "=== RESOLUCAO PERSONALIZADA ===\n\n";
-        SetColor(kGray); cout << " Digite a largura e depois a altura - max. 4 digitos cada\n";
-        cout << " Atual: " << ResLabel() << "\n\n";
-        SetColor(kAccent); cout << " > " << wd << (phaseH ? "x" : "") << ht << "_\n";
-        if (err) { SetColor(kErr); cout << " Resolucao invalida - 64 a 8192 em cada lado.\n"; }
-        SetColor(kDim);
-        cout << "\n [0-9] digitar   [X] pular pra altura   [BACKSPACE] apagar   [ENTER] confirmar   [ESC] cancelar\n";
-        SetColor(kGray);
-        int c = ReadKey();
-        err = false;
+        SetColor(kTitle); cout << "=== RESOLUCAO ===\n\n";
+        SetColor(kGray); cout << " Atual: " << ResLabel() << "\n\n";
+        SetColor(kAccent); cout << " > " << wd << (ph ? "x" : "") << ht << "_\n";
+        if (e) { SetColor(kErr); cout << " Invalido\n"; }
+        SetColor(kDim); cout << "\n[0-9] [X] [ENTER] [ESC]\n"; SetColor(kGray);
+        int c = ReadKey(); e = false;
         if (IsEsc(c)) return;
         if (IsEnter(c)) {
-            if (wd.empty() || ht.empty()) { err = true; continue; }
+            if (wd.empty() || ht.empty()) { e = true; continue; }
             int w = atoi(wd.c_str()), h = atoi(ht.c_str());
-            if (w < 64 || h < 64 || w > 8192 || h > 8192) { err = true; continue; }
-            g_cfg.outWidth = w & ~1;
-            g_cfg.outHeight = h & ~1;
-            SaveConfig();
-            return;
+            if (w < 64 || h < 64 || w > 8192 || h > 8192) { e = true; continue; }
+            g_cfg.outWidth = w & ~1; g_cfg.outHeight = h & ~1; SaveConfig(); return;
         }
-        if (c == 8) {
-            if (!ht.empty()) ht.pop_back();
-            else if (phaseH) phaseH = false;
-            else if (!wd.empty()) wd.pop_back();
-            continue;
-        }
-        if (c >= '0' && c <= '9') {
-            if (!phaseH) { if (wd.size() < 4) { wd += (char)c; if (wd.size() == 4) phaseH = true; } }
-            else if (ht.size() < 4) ht += (char)c;
-            continue;
-        }
-        if ((c == 'x' || c == 'X') && !phaseH && !wd.empty()) phaseH = true;
+        if (c == 8) { if (!ht.empty()) ht.pop_back(); else if (ph) ph = false; else if (!wd.empty()) wd.pop_back(); continue; }
+        if (c >= '0' && c <= '9') { if (!ph) { if (wd.size() < 4) { wd += (char)c; if (wd.size() == 4) ph = true; } } else if (ht.size() < 4) ht += (char)c; continue; }
+        if ((c == 'x' || c == 'X') && !ph && !wd.empty()) ph = true;
     }
 }
 static void ConfigPickResolution() {
@@ -1533,65 +1395,47 @@ static void ConfigPickResolution() {
     static const int RH[] = { 0, 480, 600, 768, 720, 800, 768, 900, 1080, 1200, 1080, 1440, 2160 };
     const int n = (int)(sizeof(RW) / sizeof(RW[0]));
     vector<string> items;
-    for (int i = 0; i < n; i++) items.push_back(RW[i] == 0 ? string("AUTO - acompanha o monitor") : to_string(RW[i]) + "x" + to_string(RH[i]));
+    for (int i = 0; i < n; i++) items.push_back(RW[i] == 0 ? "AUTO" : to_string(RW[i]) + "x" + to_string(RH[i]));
     items.push_back("Personalizado...");
     int cur = n;
     for (int i = 0; i < n; i++) if (RW[i] == g_cfg.outWidth && RH[i] == g_cfg.outHeight) { cur = i; break; }
-    int r = SelectFromList("SELECIONE A RESOLUCAO", items, cur);
+    int r = SelectFromList("RESOLUCAO", items, cur);
     if (r < 0) return;
     if (r == n) { ConfigCustomResolution(); return; }
-    g_cfg.outWidth = RW[r];
-    g_cfg.outHeight = RH[r];
-    SaveConfig();
+    g_cfg.outWidth = RW[r]; g_cfg.outHeight = RH[r]; SaveConfig();
 }
-
 static void ConfigPickCaptureTarget() {
-    vector<string> items;
-    items.push_back("Monitor inteiro (modo padrao)");
+    vector<string> items; items.push_back("Monitor inteiro");
     auto wins = ListWindows();
     for (auto& w : wins) items.push_back(WideToUtf8(w.title));
     int cur = 0;
-    if (g_cfg.captureMode == 1 && !g_cfg.windowTitle.empty()) {
-        for (size_t i = 0; i < wins.size(); i++) {
-            if (wins[i].title == g_cfg.windowTitle) { cur = (int)i + 1; break; }
-        }
-    }
-    int r = SelectFromList("SELECIONE O ALVO", items, cur);
+    if (g_cfg.captureMode == 1 && !g_cfg.windowTitle.empty())
+        for (size_t i = 0; i < wins.size(); i++) if (wins[i].title == g_cfg.windowTitle) { cur = (int)i + 1; break; }
+    int r = SelectFromList("ALVO", items, cur);
     if (r < 0) return;
-    if (r == 0) {
-        g_cfg.captureMode = 0;
-        g_cfg.windowTitle.clear();
-    }
-    else {
-        g_cfg.captureMode = 1;
-        g_cfg.windowTitle = wins[r - 1].title;
-    }
+    if (r == 0) { g_cfg.captureMode = 0; g_cfg.windowTitle.clear(); }
+    else { g_cfg.captureMode = 1; g_cfg.windowTitle = wins[r - 1].title; }
     SaveConfig();
 }
-
 static void ConfigAudioMenu() {
-    int sel = 0;
-    const int N = 5;
+    int sel = 0; const int N = 5;
     while (true) {
         ClearScreen();
         SetColor(kTitle); cout << "=== AUDIO ===\n\n";
-        string micLabel = "Padrao do Windows";
+        string micL = "Padrao";
         if (!g_cfg.micId.empty()) {
             auto mics = ListAudioDevices(eCapture);
-            bool found = false;
-            for (auto& m : mics) {
-                if (m.id == g_cfg.micId) { micLabel = m.nameUtf8; found = true; break; }
-            }
-            if (!found) micLabel = "(desconectado)";
+            bool f = false;
+            for (auto& m : mics) if (m.id == g_cfg.micId) { micL = m.nameUtf8; f = true; break; }
+            if (!f) micL = "(desconectado)";
         }
         vector<string> items;
-        items.push_back(string("Audio do Sistema   :  ") + (g_cfg.audioEnabled ? "Sim" : "Nao"));
-        items.push_back(string("Gravar Microfone   :  ") + (g_cfg.micEnabled ? "Sim" : "Nao"));
-        items.push_back("Dispositivo Mic    :  " + micLabel);
-        items.push_back("Listar dispositivos");
+        items.push_back(string("Audio Sistema : ") + (g_cfg.audioEnabled ? "Sim" : "Nao"));
+        items.push_back(string("Microfone     : ") + (g_cfg.micEnabled ? "Sim" : "Nao"));
+        items.push_back("Dispositivo   : " + micL);
+        items.push_back("Listar devices");
         items.push_back("Voltar");
-        DrawItems(items, sel);
-        DrawFooter("[ESC] voltar");
+        DrawItems(items, sel); DrawFooter("[ESC]");
         int c = ReadKey();
         if (IsUp(c)) sel = (sel + N - 1) % N;
         else if (IsDown(c)) sel = (sel + 1) % N;
@@ -1602,33 +1446,23 @@ static void ConfigAudioMenu() {
             case 1: g_cfg.micEnabled = !g_cfg.micEnabled; SaveConfig(); break;
             case 2: {
                 auto mics = ListAudioDevices(eCapture);
-                if (mics.empty()) { MessageScreen("Nenhum microfone detectado.", kErr); break; }
-                vector<string> mlist;
-                mlist.push_back("Padrao do Windows");
-                for (auto& m : mics) mlist.push_back(m.nameUtf8 + (m.isDefault ? "  (padrao)" : ""));
-                int r = SelectFromList("SELECIONE O MICROFONE", mlist, 0);
-                if (r >= 0) {
-                    if (r == 0) g_cfg.micId.clear();
-                    else g_cfg.micId = mics[r - 1].id;
-                    SaveConfig();
-                }
+                if (mics.empty()) { MessageScreen("Nenhum mic.", kErr); break; }
+                vector<string> ml; ml.push_back("Padrao");
+                for (auto& m : mics) ml.push_back(m.nameUtf8 + (m.isDefault ? " (padrao)" : ""));
+                int r = SelectFromList("MICROFONE", ml, 0);
+                if (r >= 0) { if (r == 0) g_cfg.micId.clear(); else g_cfg.micId = mics[r - 1].id; SaveConfig(); }
                 break;
             }
             case 3: {
                 auto mics = ListAudioDevices(eCapture);
                 auto spks = ListAudioDevices(eRender);
                 ClearScreen();
-                SetColor(kTitle); cout << "=== DISPOSITIVOS DE AUDIO ===\n\n";
-                SetColor(kGray);
-                cout << " Microfones (" << mics.size() << "):\n";
-                for (size_t i = 0; i < mics.size(); i++) cout << "   [" << i << "] " << mics[i].nameUtf8 << (mics[i].isDefault ? "  (padrao)" : "") << "\n";
-                cout << "\n Saidas (" << spks.size() << "):\n";
-                for (size_t i = 0; i < spks.size(); i++) cout << "   [" << i << "] " << spks[i].nameUtf8 << (spks[i].isDefault ? "  (padrao)" : "") << "\n";
-                SetColor(kDim);
-                cout << "\n Press any key...";
-                SetColor(kGray);
-                cout << flush;
-                (void)ReadKey();
+                SetColor(kTitle); cout << "=== DEVICES ===\n\n"; SetColor(kGray);
+                cout << " Mics:\n";
+                for (size_t i = 0; i < mics.size(); i++) cout << "  " << mics[i].nameUtf8 << (mics[i].isDefault ? " (padrao)" : "") << "\n";
+                cout << "\n Saidas:\n";
+                for (size_t i = 0; i < spks.size(); i++) cout << "  " << spks[i].nameUtf8 << (spks[i].isDefault ? " (padrao)" : "") << "\n";
+                SetColor(kDim); cout << "\n Press any key..."; (void)ReadKey();
                 break;
             }
             case 4: return;
@@ -1636,30 +1470,23 @@ static void ConfigAudioMenu() {
         }
     }
 }
-
 void openconfig() {
-    const int N = 9;
-    int sel = 0;
+    const int N = 9; int sel = 0;
     while (true) {
         ClearScreen();
-        SetColor(kTitle); cout << "==================================================\n";
-        SetColor(kTitle); cout << "   CONFIGURATION  -  dev - kernel11\n";
-        SetColor(kTitle); cout << "==================================================\n\n";
-        string targetLabel;
-        if (g_cfg.captureMode == 1) targetLabel = "Janela: " + WideToUtf8(g_cfg.windowTitle);
-        else targetLabel = "Monitor " + to_string(g_cfg.monitor);
+        SetColor(kTitle); cout << "=== CONFIGURATION ===\n\n";
+        string tgt = (g_cfg.captureMode == 1) ? ("Janela: " + WideToUtf8(g_cfg.windowTitle)) : ("Monitor " + to_string(g_cfg.monitor));
         vector<string> items;
-        items.push_back("FPS                :  " + to_string(g_cfg.fps));
-        items.push_back("Bitrate (kbps)     :  " + to_string(g_cfg.bitrateKbps));
-        items.push_back("Monitor            :  " + to_string(g_cfg.monitor));
-        items.push_back("Resolucao saida    :  " + ResLabel());
-        items.push_back("Formato de video   :  " + g_cfg.format);
-        items.push_back(string("Mostrar Cursor     :  ") + (g_cfg.showCursor ? "Sim" : "Nao"));
-        items.push_back("Capture Target     :  " + targetLabel);
-        items.push_back("Configurar Audio...");
+        items.push_back("FPS: " + to_string(g_cfg.fps));
+        items.push_back("Bitrate: " + to_string(g_cfg.bitrateKbps));
+        items.push_back("Monitor: " + to_string(g_cfg.monitor));
+        items.push_back("Resolucao: " + ResLabel());
+        items.push_back("Formato: " + g_cfg.format);
+        items.push_back(string("Cursor: ") + (g_cfg.showCursor ? "Sim" : "Nao"));
+        items.push_back("Alvo: " + tgt);
+        items.push_back("Audio...");
         items.push_back("Voltar");
-        DrawItems(items, sel);
-        DrawFooter("[ESC] voltar");
+        DrawItems(items, sel); DrawFooter("[ESC]");
         int c = ReadKey();
         if (IsUp(c)) sel = (sel + N - 1) % N;
         else if (IsDown(c)) sel = (sel + 1) % N;
@@ -1680,8 +1507,7 @@ void openconfig() {
     }
 }
 void mainmenu() {
-    const int N = 4;
-    int sel = 0;
+    const int N = 4; int sel = 0;
     while (true) {
         ClearScreen();
         SetColor(kTitle); cout << "==================================================\n";
@@ -1690,24 +1516,13 @@ void mainmenu() {
         SetColor(kGray);
         cout << " Status : " << (g_recorder.IsRecording() ? "RECORDING" : "STOPPED") << "\n";
         cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | " << ResLabel() << " | " << g_cfg.format
-            << " | cursor " << (g_cfg.showCursor ? "Sim" : "Nao")
-            << " | audio " << (g_cfg.audioEnabled ? "Sim" : "Nao")
-            << " | mic " << (g_cfg.micEnabled ? "Sim" : "Nao") << "\n";
-        if (g_cfg.captureMode == 1) {
-            cout << " Alvo   : Janela: " << WideToUtf8(g_cfg.windowTitle) << "\n";
-        }
-        else {
-            cout << " Alvo   : Monitor " << g_cfg.monitor << "\n";
-        }
-        if (!g_recorder.LastError().empty()) { SetColor(kErr); cout << " Ultimo erro: " << g_recorder.LastError() << "\n"; SetColor(kGray); }
+            << " | audio " << (g_cfg.audioEnabled ? "S" : "N") << " | mic " << (g_cfg.micEnabled ? "S" : "N") << "\n";
+        cout << " Alvo   : " << (g_cfg.captureMode == 1 ? ("Janela: " + WideToUtf8(g_cfg.windowTitle)) : ("Monitor " + to_string(g_cfg.monitor))) << "\n";
+        string le = g_recorder.LastError();
+        if (!le.empty()) { SetColor(kErr); cout << " Erro: " << le << "\n"; SetColor(kGray); }
         SetColor(kTitle); cout << "--------------------------------------------------\n\n";
-        vector<string> items;
-        items.push_back("Record Monitor");
-        items.push_back("Record Window");
-        items.push_back("Open Configuration");
-        items.push_back("Exit");
-        DrawItems(items, sel);
-        DrawFooter("[ESC] sair");
+        vector<string> items = { "Record Monitor", "Record Window", "Open Configuration", "Exit" };
+        DrawItems(items, sel); DrawFooter("[ESC] sair");
         int c = ReadKey();
         if (c >= '1' && c <= '4') { sel = c - '1'; c = '\r'; }
         if (IsUp(c)) sel = (sel + N - 1) % N;
@@ -1715,23 +1530,16 @@ void mainmenu() {
         else if (IsEsc(c)) { if (g_recorder.IsRecording()) g_recorder.Stop(); return; }
         else if (IsEnter(c)) {
             switch (sel) {
-            case 0: {
-                g_cfg.captureMode = 0;
-                startrecord();
-                break;
-            }
+            case 0: g_cfg.captureMode = 0; startrecord(); break;
             case 1: {
                 auto wins = ListWindows();
-                if (wins.empty()) { MessageScreen("Nenhuma janela detectada.", kErr); break; }
-                vector<string> wlist;
-                for (auto& w : wins) wlist.push_back(WideToUtf8(w.title));
-                int r = SelectFromList("SELECIONE A JANELA", wlist, 0);
+                if (wins.empty()) { MessageScreen("Nenhuma janela.", kErr); break; }
+                vector<string> wl;
+                for (auto& w : wins) wl.push_back(WideToUtf8(w.title));
+                int r = SelectFromList("JANELA", wl, 0);
                 if (r < 0) break;
-                g_cfg.captureMode = 1;
-                g_cfg.windowTitle = wins[r].title;
-                SaveConfig();
-                startrecord();
-                break;
+                g_cfg.captureMode = 1; g_cfg.windowTitle = wins[r].title; SaveConfig();
+                startrecord(); break;
             }
             case 2: openconfig(); break;
             case 3: if (g_recorder.IsRecording()) g_recorder.Stop(); return;
