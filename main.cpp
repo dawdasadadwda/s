@@ -19,6 +19,7 @@
 #include <audioclient.h>
 #include <avrt.h>
 #include <propidl.h>
+#include <dwmapi.h>
 #include <Functiondiscoverykeys_devpkey.h>
 #include <conio.h>
 #include <timeapi.h>
@@ -48,6 +49,7 @@
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
 #pragma comment(lib, "avrt.lib")
+#pragma comment(lib, "dwmapi.lib")
 #endif
 using namespace std;
 
@@ -148,11 +150,13 @@ static void SleepUntilQpc(LARGE_INTEGER target, LARGE_INTEGER freq) {
     QueryPerformanceCounter(&c);
     if (c.QuadPart >= target.QuadPart) return;
     double ms = (double)(target.QuadPart - c.QuadPart) * 1000.0 / (double)freq.QuadPart;
-    if (ms > 1.5) Sleep((DWORD)(ms - 1.0));
+    if (ms > 2.0) Sleep((DWORD)(ms - 1.0));
     for (;;) {
         QueryPerformanceCounter(&c);
         if (c.QuadPart >= target.QuadPart) break;
-        YieldProcessor();
+        double remMs = (double)(target.QuadPart - c.QuadPart) * 1000.0 / (double)freq.QuadPart;
+        if (remMs > 0.5) Sleep(0);
+        else YieldProcessor();
     }
 }
 static bool IsUp(int c) { return c == KEY_UP; }
@@ -811,6 +815,8 @@ public:
         m_lastError.clear();
         m_stopFlag.store(false);
         m_startTime = chrono::steady_clock::now();
+        m_droppedFrames.store(0);
+        m_duplicatedFrames.store(0);
         m_running.store(true);
         try { m_thread = thread(&ScreenRecorder::RecordLoop, this, cfg); }
         catch (...) { m_running.store(false); m_lastError = "falha ao criar a thread de gravacao"; return false; }
@@ -828,6 +834,8 @@ public:
         return chrono::duration<double>(chrono::steady_clock::now() - m_startTime).count();
     }
     const string& LastError() const { return m_lastError; }
+    UINT64 DroppedFrames() const { return m_droppedFrames.load(); }
+    UINT64 DuplicatedFrames() const { return m_duplicatedFrames.load(); }
 
 private:
     static const int RING = 32;
@@ -849,6 +857,7 @@ private:
         ComPtr<ID2D1Device> d2dDevice;
         ComPtr<ID2D1DeviceContext> d2dCtx;
         ComPtr<ID2D1Bitmap1> frameBmp[RING];
+        ComPtr<ID2D1Bitmap1> srcBmp[RING];
         ComPtr<ID2D1Bitmap1> curBmp;
         ComPtr<ID3D11Texture2D> wtex[RING];
         UINT wIdx = (UINT)(RING - 1);
@@ -884,12 +893,15 @@ private:
         HWND targetHwnd = nullptr;
         bool windowMode = (cfg.captureMode == 1);
         bool haveLastGood = false;
+        bool windowFrozen = false;
         chrono::steady_clock::time_point lastDuplAttempt = chrono::steady_clock::now() - chrono::seconds(10);
-        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+        DWORD acquireTimeoutMs = 8;
+        HANDLE hMmcssCapture = nullptr;
+        DWORD mmcssTaskIndex = 0;
 
         auto CreateCaptureTextures = [&](UINT w, UINT h) -> HRESULT {
             HRESULT r = S_OK;
-            for (int i = 0; i < RING; i++) staging[i].Reset();
+            for (int i = 0; i < RING; i++) { staging[i].Reset(); srcBmp[i].Reset(); }
             for (int i = 0; i < RING; i++) { wtex[i].Reset(); frameBmp[i].Reset(); }
             cpuStage.Reset(); curBmp.Reset();
             for (int i = 0; i < RING; i++) {
@@ -902,6 +914,18 @@ private:
                 td.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
                 r = d3dDev->CreateTexture2D(&td, nullptr, &staging[i]);
                 if (FAILED(r)) return r;
+                if (d2dOk) {
+                    // Bitmap D2D que "embrulha" a textura de staging (frame cheio do
+                    // monitor, sempre em texW x texH). Como ele compartilha a memoria
+                    // da GPU com a textura, qualquer CopyResource para dentro de
+                    // staging[i] atualiza automaticamente o conteudo deste bitmap -
+                    // nao e preciso recriar por frame. E a origem usada para o recorte
+                    // de janela (DrawBitmap com srcRect = retangulo da janela).
+                    ComPtr<IDXGISurface> ssurf;
+                    if (FAILED(staging[i]->QueryInterface(__uuidof(IDXGISurface), (void**)&ssurf))) return E_FAIL;
+                    D2D1_BITMAP_PROPERTIES1 sbp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+                    if (FAILED(d2dCtx->CreateBitmapFromDxgiSurface(ssurf.Get(), &sbp, &srcBmp[i]))) return E_FAIL;
+                }
             }
             for (int i = 0; i < RING; i++) {
                 D3D11_TEXTURE2D_DESC td{};
@@ -998,69 +1022,86 @@ private:
             return S_OK;
             };
 
+        // Modo janela: sempre compomos via D2D (crop + eventual escala), nunca com
+        // um "fast path" de copia direta baseado em suposicoes de tamanho identico.
+        // Isso elimina o bug de cair sem querer no ramo de tela inteira quando o
+        // tamanho do cliente da janela nao bate exatamente com outW/outH.
         auto WriteFrame = [&](double ts) -> HRESULT {
             bool wroteContent = false;
 
-            if (windowMode && targetHwnd && IsWindow(targetHwnd) && !IsIconic(targetHwnd)) {
-                RECT cr;
-                GetClientRect(targetHwnd, &cr);
-                POINT tl = { 0, 0 };
-                ClientToScreen(targetHwnd, &tl);
-
-                LONG lx = tl.x - orgX;
-                LONG ly = tl.y - orgY;
-                LONG lw = cr.right - cr.left;
-                LONG lh = cr.bottom - cr.top;
-                if (lx < 0) { lw += lx; lx = 0; }
-                if (ly < 0) { lh += ly; ly = 0; }
-                if (lx + lw > (LONG)texW) lw = (LONG)texW - lx;
-                if (ly + lh > (LONG)texH) lh = (LONG)texH - ly;
-
-                if (lw > 0 && lh > 0) {
-                    wIdx = (wIdx + 1) % RING;
-
-                    if ((UINT)lw == outW && (UINT)lh == outH) {
-                        D3D11_BOX box = {};
-                        box.left = (UINT)lx;
-                        box.top = (UINT)ly;
-                        box.front = 0;
-                        box.right = (UINT)(lx + lw);
-                        box.bottom = (UINT)(ly + lh);
-                        box.back = 1;
-                        ctx->CopySubresourceRegion(wtex[wIdx].Get(), 0, 0, 0, 0, staging[stageIdx].Get(), 0, &box);
-
-                        if (cfg.showCursor && d2dOk && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get() && frameBmp[wIdx].Get()) {
-                            d2dCtx->SetTarget(frameBmp[wIdx].Get());
-                            d2dCtx->BeginDraw();
-                            float dx = (float)(cursorX - orgX - lx - dcur.hx);
-                            float dy = (float)(cursorY - orgY - ly - dcur.hy);
-                            D2D1_RECT_F dr = D2D1::RectF(dx, dy, dx + (float)dcur.w, dy + (float)dcur.h);
-                            d2dCtx->DrawBitmap(curBmp.Get(), &dr);
-                            HRESULT hd = d2dCtx->EndDraw();
-                            if (FAILED(hd)) {
-                                d2dCtx.Reset(); d2dDevice.Reset(); d2dFactory.Reset(); curBmp.Reset();
-                                d2dOk = false;
-                            }
-                        }
+            if (windowMode) {
+                bool winOk = targetHwnd && IsWindow(targetHwnd) && !IsIconic(targetHwnd);
+                bool cloaked = false;
+                if (winOk) {
+                    DWORD cloakedVal = 0;
+                    if (SUCCEEDED(DwmGetWindowAttribute(targetHwnd, DWMWA_CLOAKED, &cloakedVal, sizeof(cloakedVal)))) {
+                        cloaked = (cloakedVal != 0);
                     }
-                    else if (d2dOk && frameBmp[wIdx].Get()) {
+                }
+                if (winOk && !cloaked) {
+                    RECT cr;
+                    GetClientRect(targetHwnd, &cr);
+                    POINT tl = { 0, 0 };
+                    ClientToScreen(targetHwnd, &tl);
+
+                    LONG lx = tl.x - orgX;
+                    LONG ly = tl.y - orgY;
+                    LONG lw = cr.right - cr.left;
+                    LONG lh = cr.bottom - cr.top;
+                    if (lx < 0) { lw += lx; lx = 0; }
+                    if (ly < 0) { lh += ly; ly = 0; }
+                    if (lx + lw > (LONG)texW) lw = (LONG)texW - lx;
+                    if (ly + lh > (LONG)texH) lh = (LONG)texH - ly;
+
+                    if (lw > 0 && lh > 0 && d2dOk && srcBmp[stageIdx].Get()) {
+                        wIdx = (wIdx + 1) % RING;
                         d2dCtx->SetTarget(frameBmp[wIdx].Get());
                         d2dCtx->BeginDraw();
                         d2dCtx->Clear(D2D1::ColorF(0, 0, 0, 1.0f));
                         D2D1_RECT_F srcRect = D2D1::RectF((float)lx, (float)ly, (float)(lx + lw), (float)(ly + lh));
                         D2D1_RECT_F dstRect = D2D1::RectF(0, 0, (float)outW, (float)outH);
-                        d2dCtx->DrawBitmap(frameBmp[wIdx].Get(), &dstRect, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, &srcRect);
+                        d2dCtx->DrawBitmap(srcBmp[stageIdx].Get(), &dstRect, 1.0f, D2D1_INTERPOLATION_MODE_LINEAR, &srcRect);
+                        if (cfg.showCursor && cursorInit && cursorVisible && dcur.w > 0 && curBmp.Get()) {
+                            float sx = (float)outW / (float)max<LONG>(1, lw);
+                            float sy = (float)outH / (float)max<LONG>(1, lh);
+                            float dx = ((float)(cursorX - orgX - lx - dcur.hx)) * sx;
+                            float dy = ((float)(cursorY - orgY - ly - dcur.hy)) * sy;
+                            D2D1_RECT_F dr = D2D1::RectF(dx, dy, dx + (float)dcur.w * sx, dy + (float)dcur.h * sy);
+                            d2dCtx->DrawBitmap(curBmp.Get(), &dr);
+                        }
                         HRESULT hd = d2dCtx->EndDraw();
                         if (FAILED(hd)) {
                             d2dCtx.Reset(); d2dDevice.Reset(); d2dFactory.Reset(); curBmp.Reset();
                             d2dOk = false;
                         }
+                        wroteContent = true;
+                        haveLastGood = true;
+                        windowFrozen = false;
                     }
-                    wroteContent = true;
-                    haveLastGood = true;
+                    else if (lw > 0 && lh > 0 && !d2dOk) {
+                        wIdx = (wIdx + 1) % RING;
+                        D3D11_BOX box = {};
+                        box.left = (UINT)lx; box.top = (UINT)ly; box.front = 0;
+                        box.right = (UINT)min<LONG>(lx + lw, (LONG)texW);
+                        box.bottom = (UINT)min<LONG>(ly + lh, (LONG)texH);
+                        box.back = 1;
+                        UINT cw = box.right - box.left, ch = box.bottom - box.top;
+                        cw = min(cw, outW); ch = min(ch, outH);
+                        box.right = box.left + cw; box.bottom = box.top + ch;
+                        ctx->CopySubresourceRegion(wtex[wIdx].Get(), 0, 0, 0, 0, staging[stageIdx].Get(), 0, &box);
+                        wroteContent = true;
+                        haveLastGood = true;
+                        windowFrozen = false;
+                    }
+                }
+                else {
+                    // Janela minimizada/oculta (ex.: alt-tab em fullscreen exclusivo).
+                    // Nao tentamos compor lixo: apenas repetimos o ultimo frame bom
+                    // (congelamento controlado), sem alterar buffers/estado de cursor.
+                    windowFrozen = true;
                 }
             }
-            else if (!windowMode) {
+            else {
                 wIdx = (wIdx + 1) % RING;
                 ctx->CopyResource(wtex[wIdx].Get(), staging[stageIdx].Get());
 
@@ -1086,6 +1127,7 @@ private:
             }
             else if (!wroteContent && haveLastGood) {
                 wIdx = (wIdx == 0) ? (RING - 1) : (wIdx - 1);
+                m_duplicatedFrames.fetch_add(1);
             }
 
             ID3D11Texture2D* srcTex = wtex[wIdx].Get();
@@ -1158,6 +1200,12 @@ private:
         useSysAudio = cfg.audioEnabled && ProbeDefaultEndpoint(eRender);
         useMic = cfg.micEnabled && ProbeDefaultEndpoint(eCapture);
         QueryPerformanceFrequency(&qpf);
+        // Prioridade normal + classe MMCSS "Capture": garante boa prioridade de
+        // agendamento para a thread de captura sem brigar por CPU com o jogo do
+        // jeito que THREAD_PRIORITY_ABOVE_NORMAL fazia sob carga alta.
+        SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_NORMAL);
+        hMmcssCapture = AvSetMmThreadCharacteristicsW(L"Capture", &mmcssTaskIndex);
+        if (!hMmcssCapture) hMmcssCapture = AvSetMmThreadCharacteristicsW(L"Games", &mmcssTaskIndex);
         {
             UINT devFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
             D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
@@ -1215,6 +1263,7 @@ private:
             hr = CreateCaptureTextures(texW, texH);
             if (FAILED(hr)) { err = "CreateTexture2D staging"; failHR = (DWORD)hr; goto cleanup; }
             if (!d2dOk && cfg.showCursor) cout << "\n cursor: falha ao iniciar composicao - gravando sem cursor\n";
+            if (windowMode && !d2dOk) cout << "\n aviso: composicao D2D indisponivel - recorte de janela em modo de compatibilidade\n";
             wstring wfile = Utf8ToWide(curFile);
             hr = CreateVideoWriter(wfile);
             if (FAILED(hr)) { err = "nao foi possivel iniciar o encoder"; failHR = (DWORD)hr; goto cleanup; }
@@ -1229,6 +1278,9 @@ private:
         }
         QueryPerformanceCounter(&t0);
         frameDurHns = 10'000'000.0 / (double)cfg.fps;
+        // Timeout de aquisicao proporcional ao periodo do frame (limitado entre 2 e 16ms)
+        // em vez de fixo em 1ms - reduz polling excessivo sem atrasar o pacing.
+        acquireTimeoutMs = (DWORD)max(2.0, min(16.0, (frameDurHns / 10000.0) * 0.5));
 
         while (!m_stopFlag.load()) {
             if (!dupl.Get()) {
@@ -1273,9 +1325,12 @@ private:
                     haveNew = false; wroteAny = false;
                     cout << "\n resolucao alterada para " << texW << "x" << texH << " - continuando em novo arquivo: " << curFile << "\n";
                 }
+                else if (windowMode) {
+                    texW = nw; texH = nh;
+                }
             }
 
-            hr = dupl->AcquireNextFrame(1, &frameInfo, &res);
+            hr = dupl->AcquireNextFrame(acquireTimeoutMs, &frameInfo, &res);
             if (hr == S_OK) {
                 framePending = true;
                 if (d2dOk && cfg.showCursor) {
@@ -1315,6 +1370,9 @@ private:
                 res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frameTex);
                 if (frameTex.Get()) {
                     ctx->CopyResource(staging[stageIdx].Get(), frameTex.Get());
+                    // srcBmp[stageIdx] ja embrulha staging[stageIdx] (criado em
+                    // CreateCaptureTextures) e reflete este CopyResource automaticamente,
+                    // pois compartilha a mesma superficie DXGI - nada mais a fazer aqui.
                 }
                 frameTex.Reset();
                 res.Reset();
@@ -1323,6 +1381,7 @@ private:
                 haveNew = true;
             }
             else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+                if (haveNew == false) m_droppedFrames.fetch_add(0); // sem novidade; nao conta como drop, apenas idle
             }
             else if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL || hr == E_ACCESSDENIED) {
                 if (framePending && dupl.Get()) {
@@ -1345,12 +1404,24 @@ private:
             double elapsedHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
             double dueTs = (double)writeCount * frameDurHns;
 
-            if (elapsedHns >= dueTs && (haveNew || wroteAny)) {
+            // CORRECAO CRITICA (stutter / aceleracao subita / FPS instavel):
+            // em vez de escrever no maximo 1 frame por iteracao do loop mesmo
+            // quando ja estamos muito atrasados em relacao ao relogio real,
+            // fazemos "catch-up": escrevemos quantos frames (duplicando o
+            // ultimo conteudo disponivel) forem necessarios para que o numero
+            // de amostras gravadas acompanhe o tempo de parede real. Sem isso,
+            // qualquer atraso (WriteSample lento, troca de encoder, disco lento)
+            // fazia o video final ter menos frames do que o tempo real decorrido,
+            // o que se manifesta como "o video acelera sozinho".
+            const UINT64 MAX_CATCHUP_PER_TICK = (UINT64)max(1, cfg.fps * 2);
+            UINT64 catchup = 0;
+            while (elapsedHns >= dueTs && (haveNew || wroteAny) && catchup < MAX_CATCHUP_PER_TICK) {
                 hr = WriteFrame(dueTs);
                 if (FAILED(hr)) {
                     if (!wroteAny && !useRam) {
                         useRam = true;
                         cout << "\n encoder recusou textura de GPU - usando modo de compatibilidade em RAM\n";
+                        continue;
                     }
                     else {
                         err = "WriteSample";
@@ -1358,11 +1429,22 @@ private:
                         goto cleanup;
                     }
                 }
-                else {
-                    wroteAny = true;
-                    writeCount++;
-                    haveNew = false;
-                }
+                wroteAny = true;
+                writeCount++;
+                haveNew = false;
+                catchup++;
+                dueTs = (double)writeCount * frameDurHns;
+            }
+            if (catchup > 1) {
+                m_duplicatedFrames.fetch_add(catchup - 1);
+            }
+            if (catchup >= MAX_CATCHUP_PER_TICK) {
+                // atraso maior que 2x a duracao de um segundo de frames: nao tenta
+                // recuperar tudo de uma vez (evita travar o loop), realinha o
+                // relogio de referencia para o instante atual e conta como perda.
+                m_droppedFrames.fetch_add(1);
+                QueryPerformanceCounter(&t0);
+                writeCount = 0;
             }
 
             QueryPerformanceCounter(&now);
@@ -1387,7 +1469,7 @@ private:
         }
         writer.Reset();
         dxgiMan.Reset();
-        for (int i = 0; i < RING; i++) staging[i].Reset();
+        for (int i = 0; i < RING; i++) { staging[i].Reset(); srcBmp[i].Reset(); }
         cpuStage.Reset();
         for (int i = 0; i < RING; i++) { frameBmp[i].Reset(); wtex[i].Reset(); }
         curBmp.Reset();
@@ -1396,6 +1478,7 @@ private:
         d2dFactory.Reset();
         dupl.Reset(); output1.Reset(); output.Reset(); adapter.Reset(); dxgiDev.Reset();
         mt.Reset(); ctx.Reset(); d3dDev.Reset();
+        if (hMmcssCapture) AvRevertMmThreadCharacteristics(hMmcssCapture);
         if (mfHere) MFShutdown();
         if (comHere) CoUninitialize();
         if (!err.empty()) {
@@ -1405,12 +1488,15 @@ private:
         }
         m_running.store(false);
     }
+
     thread m_thread;
     atomic<bool> m_running{ false };
     atomic<bool> m_stopFlag{ false };
     chrono::steady_clock::time_point m_startTime;
     string m_lastError;
     AudioMixer m_mixer;
+    atomic<UINT64> m_droppedFrames{ 0 };
+    atomic<UINT64> m_duplicatedFrames{ 0 };
 };
 
 ScreenRecorder g_recorder;
@@ -1449,6 +1535,7 @@ static void RecordingScreen() {
     SetColor(kAccent); cout << "\n   >>> Press ENTER to finish record. <<<\n\n";
     SetColor(kGray);
     int lastSec = -1;
+    UINT64 lastDrop = (UINT64)-1, lastDup = (UINT64)-1;
     while (g_recorder.IsRecording()) {
         int c = -1;
         if (_kbhit()) {
@@ -1457,12 +1544,16 @@ static void RecordingScreen() {
         }
         if (IsEnter(c) || IsEsc(c)) break;
         int sec = (int)g_recorder.ElapsedSeconds();
-        if (sec != lastSec) {
-            lastSec = sec;
+        UINT64 drop = g_recorder.DroppedFrames();
+        UINT64 dup = g_recorder.DuplicatedFrames();
+        if (sec != lastSec || drop != lastDrop || dup != lastDup) {
+            lastSec = sec; lastDrop = drop; lastDup = dup;
             if (hasPos) {
                 SetConsoleCursorPosition(hConsole(), timerPos);
                 SetColor(kAccent);
-                cout << setw(2) << setfill('0') << (sec / 60) << ":" << setw(2) << setfill('0') << (sec % 60) << "  " << flush;
+                cout << setw(2) << setfill('0') << (sec / 60) << ":" << setw(2) << setfill('0') << (sec % 60) << "  ";
+                SetColor(kDim);
+                cout << " (perdidos: " << drop << " | duplicados: " << dup << ")   " << flush;
                 SetColor(kGray);
             }
         }
