@@ -15,6 +15,11 @@
 #include <mfreadwrite.h>
 #include <codecapi.h>
 #include <d2d1_1.h>
+#include <mmdeviceapi.h>
+#include <audioclient.h>
+#include <avrt.h>
+#include <propidl.h>
+#include <Functiondiscoverykeys_devpkey.h>
 #include <conio.h>
 #include <timeapi.h>
 #include <ctime>
@@ -41,6 +46,7 @@
 #pragma comment(lib, "gdi32.lib")
 #pragma comment(lib, "winmm.lib")
 #pragma comment(lib, "ole32.lib")
+#pragma comment(lib, "avrt.lib")
 #endif
 using namespace std;
 
@@ -72,6 +78,9 @@ struct Config {
     int outHeight = 0;
     string format = "mp4";
     bool showCursor = true;
+    bool audioEnabled = true;
+    bool micEnabled = true;
+    wstring micId;
     string outputFile;
 };
 Config g_cfg;
@@ -131,18 +140,6 @@ static int ReadKey() {
         Sleep(10);
     }
 }
-static void SleepUntilQpc(LARGE_INTEGER target, LARGE_INTEGER freq) {
-    LARGE_INTEGER c;
-    QueryPerformanceCounter(&c);
-    if (c.QuadPart >= target.QuadPart) return;
-    double ms = (double)(target.QuadPart - c.QuadPart) * 1000.0 / (double)freq.QuadPart;
-    if (ms > 1.5) Sleep((DWORD)(ms - 1.0));
-    for (;;) {
-        QueryPerformanceCounter(&c);
-        if (c.QuadPart >= target.QuadPart) break;
-        YieldProcessor();
-    }
-}
 static bool IsUp(int c) { return c == KEY_UP; }
 static bool IsDown(int c) { return c == KEY_DOWN; }
 static bool IsEnter(int c) { return c == '\r' || c == '\n'; }
@@ -182,7 +179,7 @@ static void MessageScreen(const string& msg, WORD color = kGray) {
     cout << " Press any key...";
     SetColor(kGray);
     cout << flush;
-    ReadKey();
+    (void)ReadKey();
 }
 static int SelectFromList(const string& titulo, const vector<string>& items, int selIni) {
     int n = (int)items.size(), sel = max(0, min(n - 1, selIni));
@@ -249,6 +246,50 @@ static vector<MonitorInfo> ListMonitors() {
     return out;
 }
 
+struct AudioDeviceInfo {
+    wstring id;
+    string nameUtf8;
+    bool isDefault;
+};
+static vector<AudioDeviceInfo> ListAudioDevices(EDataFlow flow) {
+    vector<AudioDeviceInfo> out;
+    ComPtr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) return out;
+    ComPtr<IMMDevice> defDev;
+    wstring defId;
+    if (SUCCEEDED(en->GetDefaultAudioEndpoint(flow, eConsole, &defDev))) {
+        LPWSTR did = nullptr;
+        if (SUCCEEDED(defDev->GetId(&did))) { defId = did; CoTaskMemFree(did); }
+    }
+    ComPtr<IMMDeviceCollection> col;
+    if (FAILED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &col))) return out;
+    UINT count = 0;
+    col->GetCount(&count);
+    for (UINT i = 0; i < count; i++) {
+        ComPtr<IMMDevice> d;
+        if (FAILED(col->Item(i, &d))) continue;
+        LPWSTR id = nullptr;
+        if (FAILED(d->GetId(&id))) continue;
+        ComPtr<IPropertyStore> props;
+        string name = "Desconhecido";
+        if (SUCCEEDED(d->OpenPropertyStore(STGM_READ, &props))) {
+            PROPVARIANT pv;
+            PropVariantInit(&pv);
+            if (SUCCEEDED(props->GetValue(PKEY_Device_FriendlyName, &pv)) && pv.vt == VT_LPWSTR) {
+                name = WideToUtf8(pv.pwszVal);
+            }
+            PropVariantClear(&pv);
+        }
+        AudioDeviceInfo info;
+        info.id = id;
+        info.nameUtf8 = name;
+        info.isDefault = (defId == id);
+        out.push_back(info);
+        CoTaskMemFree(id);
+    }
+    return out;
+}
+
 static void SaveConfig() {
     ofstream f(kConfigFile);
     if (!f) return;
@@ -259,6 +300,9 @@ static void SaveConfig() {
     f << "height=" << g_cfg.outHeight << "\n";
     f << "format=" << g_cfg.format << "\n";
     f << "cursor=" << (g_cfg.showCursor ? 1 : 0) << "\n";
+    f << "audio=" << (g_cfg.audioEnabled ? 1 : 0) << "\n";
+    f << "mic=" << (g_cfg.micEnabled ? 1 : 0) << "\n";
+    f << "micid=" << WideToUtf8(g_cfg.micId) << "\n";
 }
 static void LoadConfig() {
     ifstream f(kConfigFile);
@@ -276,11 +320,21 @@ static void LoadConfig() {
             else if (key == "height") g_cfg.outHeight = max(0, stoi(val));
             else if (key == "format" && (val == "mp4" || val == "wmv")) g_cfg.format = val;
             else if (key == "cursor") g_cfg.showCursor = (val == "1");
+            else if (key == "audio") g_cfg.audioEnabled = (val == "1");
+            else if (key == "mic") g_cfg.micEnabled = (val == "1");
+            else if (key == "micid") g_cfg.micId = Utf8ToWide(val);
         }
         catch (...) {}
     }
 }
 
+static bool ProbeDefaultEndpoint(EDataFlow flow) {
+    ComPtr<IMMDeviceEnumerator> en;
+    if (FAILED(CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&en))) return false;
+    ComPtr<IMMDevice> dev;
+    if (FAILED(en->GetDefaultAudioEndpoint(flow, eConsole, &dev))) return false;
+    return dev.Get() != nullptr;
+}
 
 struct DecodedCursor {
     vector<BYTE> px;
@@ -346,6 +400,158 @@ static bool DecodeCursor(HICON hc, DecodedCursor& dc) {
     return ok;
 }
 
+class AudioCapture {
+public:
+    explicit AudioCapture(bool isMic) : m_isMic(isMic) {}
+    bool Start(IMFSinkWriter* writer, DWORD streamIdx, const wstring& deviceId = L"") {
+        if (m_running.load()) return false;
+        if (m_thread.joinable()) m_thread.join();
+        m_stopFlag.store(false);
+        m_writer = writer;
+        m_streamIdx = streamIdx;
+        m_deviceId = deviceId;
+        m_lastError.clear();
+        try {
+            m_thread = thread(&AudioCapture::ThreadProc, this);
+        }
+        catch (...) {
+            m_lastError = "falha ao criar thread de audio";
+            return false;
+        }
+        for (int i = 0; i < 200; i++) {
+            if (m_running.load() || !m_lastError.empty()) break;
+            Sleep(10);
+        }
+        return m_lastError.empty();
+    }
+    void Stop() {
+        m_stopFlag.store(true);
+        if (m_thread.joinable()) m_thread.join();
+        m_running.store(false);
+    }
+    bool IsRunning() const { return m_running.load(); }
+    string LastError() const { return m_lastError; }
+private:
+    void ThreadProc() {
+        HRESULT hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        bool comHere = SUCCEEDED(hr);
+        DWORD taskIndex = 0;
+        HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
+        ComPtr<IMMDeviceEnumerator> enumerator;
+        ComPtr<IMMDevice> device;
+        ComPtr<IAudioClient> audioClient;
+        ComPtr<IAudioCaptureClient> captureClient;
+        HANDLE hEvent = nullptr;
+
+        do {
+            hr = CoCreateInstance(__uuidof(MMDeviceEnumerator), nullptr, CLSCTX_ALL, __uuidof(IMMDeviceEnumerator), (void**)&enumerator);
+            if (FAILED(hr)) { m_lastError = "MMDeviceEnumerator falhou"; break; }
+
+            if (m_deviceId.empty()) {
+                hr = enumerator->GetDefaultAudioEndpoint(m_isMic ? eCapture : eRender, eConsole, &device);
+            }
+            else {
+                hr = enumerator->GetDevice(m_deviceId.c_str(), &device);
+                if (FAILED(hr)) hr = enumerator->GetDefaultAudioEndpoint(m_isMic ? eCapture : eRender, eConsole, &device);
+            }
+            if (FAILED(hr)) { m_lastError = m_isMic ? "nenhum microfone padrao" : "nenhum dispositivo de saida"; break; }
+
+            hr = device->Activate(__uuidof(IAudioClient), CLSCTX_ALL, nullptr, (void**)&audioClient);
+            if (FAILED(hr)) { m_lastError = "IAudioClient Activate falhou"; break; }
+
+            WAVEFORMATEX wf{};
+            wf.wFormatTag = WAVE_FORMAT_PCM;
+            wf.nChannels = 2;
+            wf.nSamplesPerSec = 48000;
+            wf.wBitsPerSample = 16;
+            wf.nBlockAlign = (WORD)((wf.nChannels * wf.wBitsPerSample) / 8);
+            wf.nAvgBytesPerSec = wf.nSamplesPerSec * wf.nBlockAlign;
+            wf.cbSize = 0;
+
+            DWORD initFlags = AUDCLNT_STREAMFLAGS_EVENTCALLBACK |
+                AUDCLNT_STREAMFLAGS_AUTOCONVERTPCM |
+                AUDCLNT_STREAMFLAGS_SRC_DEFAULT_QUALITY;
+            if (!m_isMic) initFlags |= AUDCLNT_STREAMFLAGS_LOOPBACK;
+
+            hr = audioClient->Initialize(AUDCLNT_SHAREMODE_SHARED, initFlags, 1000000, 0, &wf, nullptr);
+            if (FAILED(hr)) { m_lastError = "IAudioClient Initialize falhou"; break; }
+
+            hEvent = CreateEventW(nullptr, FALSE, FALSE, nullptr);
+            if (!hEvent) { m_lastError = "CreateEvent falhou"; break; }
+
+            hr = audioClient->SetEventHandle(hEvent);
+            if (FAILED(hr)) { m_lastError = "SetEventHandle falhou"; break; }
+
+            hr = audioClient->GetService(__uuidof(IAudioCaptureClient), (void**)&captureClient);
+            if (FAILED(hr)) { m_lastError = "GetService(IAudioCaptureClient) falhou"; break; }
+
+            hr = audioClient->Start();
+            if (FAILED(hr)) { m_lastError = "IAudioClient Start falhou"; break; }
+
+            m_running.store(true);
+            LONGLONG samplePos = 0;
+
+            while (!m_stopFlag.load()) {
+                DWORD wait = WaitForSingleObject(hEvent, 100);
+                if (wait != WAIT_OBJECT_0) continue;
+                if (m_stopFlag.load()) break;
+
+                UINT32 packetLength = 0;
+                hr = captureClient->GetNextPacketSize(&packetLength);
+                while (SUCCEEDED(hr) && packetLength > 0 && !m_stopFlag.load()) {
+                    BYTE* data = nullptr;
+                    UINT32 numFrames = 0;
+                    DWORD flags = 0;
+                    hr = captureClient->GetBuffer(&data, &numFrames, &flags, nullptr, nullptr);
+                    if (FAILED(hr)) break;
+
+                    UINT32 bytes = numFrames * 4;
+                    ComPtr<IMFMediaBuffer> buf;
+                    if (SUCCEEDED(MFCreateMemoryBuffer(bytes, &buf))) {
+                        BYTE* dst = nullptr;
+                        if (SUCCEEDED(buf->Lock(&dst, nullptr, nullptr))) {
+                            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(dst, 0, bytes);
+                            else memcpy(dst, data, bytes);
+                            buf->Unlock();
+                            buf->SetCurrentLength(bytes);
+
+                            ComPtr<IMFSample> sample;
+                            if (SUCCEEDED(MFCreateSample(&sample))) {
+                                sample->AddBuffer(buf.Get());
+                                LONGLONG ts = (samplePos * 10000000LL) / 48000;
+                                LONGLONG dur = ((LONGLONG)numFrames * 10000000LL) / 48000;
+                                sample->SetSampleTime(ts);
+                                sample->SetSampleDuration(dur);
+                                m_writer->WriteSample(m_streamIdx, sample.Get());
+                            }
+                        }
+                    }
+
+                    samplePos += numFrames;
+                    captureClient->ReleaseBuffer(numFrames);
+                    hr = captureClient->GetNextPacketSize(&packetLength);
+                }
+            }
+
+            audioClient->Stop();
+        } while (false);
+
+        if (hEvent) CloseHandle(hEvent);
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
+        if (comHere) CoUninitialize();
+        m_running.store(false);
+    }
+
+    thread m_thread;
+    atomic<bool> m_stopFlag{ false };
+    atomic<bool> m_running{ false };
+    IMFSinkWriter* m_writer = nullptr;
+    DWORD m_streamIdx = 0;
+    bool m_isMic = false;
+    wstring m_deviceId;
+    string m_lastError;
+};
+
 class ScreenRecorder {
 public:
     bool Start(const Config& cfg) {
@@ -377,6 +583,7 @@ public:
     }
     const string& LastError() const { return m_lastError; }
 private:
+    static const int RING = 32;
     void RecordLoop(Config cfg) {
         HRESULT hr = S_OK;
         string err;
@@ -389,16 +596,16 @@ private:
         ComPtr<IDXGIOutput> output;
         ComPtr<IDXGIOutput1> output1;
         ComPtr<IDXGIOutputDuplication> dupl;
-        ComPtr<ID3D11Texture2D> staging[8];
+        ComPtr<ID3D11Texture2D> staging[RING];
         ComPtr<ID2D1Factory1> d2dFactory;
         ComPtr<ID2D1Device> d2dDevice;
         ComPtr<ID2D1DeviceContext> d2dCtx;
-        ComPtr<ID2D1Bitmap1> frameBmp[8];
+        ComPtr<ID2D1Bitmap1> frameBmp[RING];
         ComPtr<ID2D1Bitmap1> curBmp;
-        ComPtr<ID3D11Texture2D> wtex[8];
+        ComPtr<ID3D11Texture2D> wtex[RING];
         ComPtr<ID2D1Bitmap1> modeBmp;
         ComPtr<ID3D11Texture2D> modeTex;
-        UINT wIdx = 0, lastWIdx = 0xFF;
+        UINT wIdx = (UINT)(RING - 1);
         HICON lastCur = nullptr;
         DecodedCursor dcur;
         LONG orgX = 0, orgY = 0;
@@ -407,7 +614,6 @@ private:
         LONG cursorX = 0, cursorY = 0;
         LONG64 lastMouseStamp = 0;
         bool d2dOk = false, pendingScale = false;
-        int segCount = 1;
         ComPtr<IMFDXGIDeviceManager> dxgiMan;
         ComPtr<IMFAttributes> attrs;
         ComPtr<IMFSinkWriter> writer;
@@ -420,21 +626,29 @@ private:
         LARGE_INTEGER qpf{}, t0{}, now{};
         UINT texW = 0, texH = 0, outW = 0, outH = 0, stageIdx = 0;
         bool haveNew = false, wroteAny = false, comHere = false, mfHere = false, useRam = false;
+        bool framePending = false;
         DWORD rowBytes = 0, frameSize = 0;
         ComPtr<ID3D11Texture2D> cpuStage;
         D3D11_MAPPED_SUBRESOURCE mp{};
         BYTE* dstp = nullptr;
-        DWORD streamIdx = 0;
+        DWORD videoStreamIdx = 0;
+        DWORD audioStreamIdx = 0;
+        DWORD micStreamIdx = 0;
+        bool useSysAudio = false;
+        bool useMic = false;
         UINT writeCount = 0;
+        int segCount = 1;
         double elapsedHns = 0.0, frameDurHns = 0.0;
         DXGI_OUTDUPL_DESC dupDesc{};
+        string curFile = cfg.outputFile;
         SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_ABOVE_NORMAL);
+
         auto CreateCaptureTextures = [&](UINT w, UINT h) -> HRESULT {
             HRESULT r = S_OK;
-            for (int i = 0; i < 8; i++) staging[i].Reset();
-            for (int i = 0; i < 8; i++) { wtex[i].Reset(); frameBmp[i].Reset(); }
+            for (int i = 0; i < RING; i++) staging[i].Reset();
+            for (int i = 0; i < RING; i++) { wtex[i].Reset(); frameBmp[i].Reset(); }
             modeTex.Reset(); modeBmp.Reset(); cpuStage.Reset(); curBmp.Reset();
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < RING; i++) {
                 D3D11_TEXTURE2D_DESC td{};
                 td.Width = w; td.Height = h;
                 td.MipLevels = 1; td.ArraySize = 1;
@@ -445,7 +659,7 @@ private:
                 r = d3dDev->CreateTexture2D(&td, nullptr, &staging[i]);
                 if (FAILED(r)) return r;
             }
-            for (int i = 0; i < 8; i++) {
+            for (int i = 0; i < RING; i++) {
                 D3D11_TEXTURE2D_DESC td{};
                 td.Width = w; td.Height = h;
                 td.MipLevels = 1; td.ArraySize = 1;
@@ -464,6 +678,34 @@ private:
             }
             return S_OK;
             };
+
+        auto AddAacStream = [&](IMFSinkWriter* w, DWORD* outIdx) -> bool {
+            ComPtr<IMFMediaType> ao;
+            MFCreateMediaType(&ao);
+            ao->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            ao->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_AAC);
+            ao->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            ao->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+            ao->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+            ao->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 24000);
+            ao->SetUINT32(MF_MT_AAC_PAYLOAD_TYPE, 0);
+            DWORD idx = 0;
+            if (FAILED(w->AddStream(ao.Get(), &idx))) return false;
+            ComPtr<IMFMediaType> ai;
+            MFCreateMediaType(&ai);
+            ai->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Audio);
+            ai->SetGUID(MF_MT_SUBTYPE, MFAudioFormat_PCM);
+            ai->SetUINT32(MF_MT_AUDIO_BITS_PER_SAMPLE, 16);
+            ai->SetUINT32(MF_MT_AUDIO_SAMPLES_PER_SECOND, 48000);
+            ai->SetUINT32(MF_MT_AUDIO_NUM_CHANNELS, 2);
+            ai->SetUINT32(MF_MT_AUDIO_BLOCK_ALIGNMENT, 4);
+            ai->SetUINT32(MF_MT_AUDIO_AVG_BYTES_PER_SECOND, 192000);
+            ai->SetUINT32(MF_MT_ALL_SAMPLES_INDEPENDENT, TRUE);
+            if (FAILED(w->SetInputMediaType(idx, ai.Get(), nullptr))) return false;
+            *outIdx = idx;
+            return true;
+            };
+
         auto CreateVideoWriter = [&](UINT inW, UINT inH, UINT oW, UINT oH, const wstring& file) -> HRESULT {
             ComPtr<IMFAttributes> at;
             MFCreateAttributes(&at, 4);
@@ -474,6 +716,7 @@ private:
             ComPtr<IMFSinkWriter> w;
             HRESULT r = MFCreateSinkWriterFromURL(file.c_str(), nullptr, at.Get(), &w);
             if (FAILED(r)) return r;
+
             ComPtr<IMFMediaType> ot;
             MFCreateMediaType(&ot);
             ot->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -487,6 +730,8 @@ private:
             DWORD si = 0;
             r = w->AddStream(ot.Get(), &si);
             if (FAILED(r)) return r;
+            videoStreamIdx = si;
+
             ComPtr<IMFMediaType> it2;
             MFCreateMediaType(&it2);
             it2->SetGUID(MF_MT_MAJOR_TYPE, MFMediaType_Video);
@@ -497,18 +742,26 @@ private:
             MFSetAttributeRatio(it2.Get(), MF_MT_PIXEL_ASPECT_RATIO, 1, 1);
             r = w->SetInputMediaType(si, it2.Get(), nullptr);
             if (FAILED(r)) return r;
+
+            audioStreamIdx = 0;
+            micStreamIdx = 0;
+            if (useSysAudio) AddAacStream(w.Get(), &audioStreamIdx);
+            if (useMic) AddAacStream(w.Get(), &micStreamIdx);
+
             r = w->BeginWriting();
             if (FAILED(r)) return r;
             writer.Reset(w.Detach());
-            streamIdx = si;
             return S_OK;
             };
-        QueryPerformanceFrequency(&qpf);
+
         hr = CoInitializeEx(nullptr, COINIT_MULTITHREADED);
         if (SUCCEEDED(hr)) comHere = true;
         hr = MFStartup(MF_VERSION, MFSTARTUP_LITE);
         if (FAILED(hr)) { err = "MFStartup falhou"; failHR = (DWORD)hr; goto cleanup; }
         mfHere = true;
+        useSysAudio = cfg.audioEnabled && ProbeDefaultEndpoint(eRender);
+        useMic = cfg.micEnabled && ProbeDefaultEndpoint(eCapture);
+        QueryPerformanceFrequency(&qpf);
         {
             UINT devFlags = D3D11_CREATE_DEVICE_BGRA_SUPPORT | D3D11_CREATE_DEVICE_VIDEO_SUPPORT;
             D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_1, D3D_FEATURE_LEVEL_10_0 };
@@ -552,24 +805,164 @@ private:
             hr = CreateCaptureTextures(texW, texH);
             if (FAILED(hr)) { err = "CreateTexture2D staging"; failHR = (DWORD)hr; goto cleanup; }
             if (!d2dOk && cfg.showCursor) cout << "\n cursor: falha ao iniciar composicao - gravando sem cursor\n";
-            wstring wfile = Utf8ToWide(cfg.outputFile);
+            wstring wfile = Utf8ToWide(curFile);
             hr = CreateVideoWriter(texW, texH, outW, outH, wfile);
             if (FAILED(hr)) { err = "nao foi possivel iniciar o encoder"; failHR = (DWORD)hr; goto cleanup; }
+            if (useSysAudio && audioStreamIdx > 0) {
+                if (!m_audio.Start(writer.Get(), audioStreamIdx)) {
+                    cout << "\n audio do sistema: falha (" << m_audio.LastError() << ") - continuando sem\n";
+                    useSysAudio = false;
+                    audioStreamIdx = 0;
+                }
+            }
+            if (useMic && micStreamIdx > 0) {
+                if (!m_mic.Start(writer.Get(), micStreamIdx, cfg.micId)) {
+                    cout << "\n microfone: falha (" << m_mic.LastError() << ") - continuando sem\n";
+                    useMic = false;
+                    micStreamIdx = 0;
+                }
+            }
         }
         QueryPerformanceCounter(&t0);
         frameDurHns = 10'000'000.0 / (double)cfg.fps;
+
         while (!m_stopFlag.load()) {
+            if (!dupl.Get()) {
+                if (framePending) framePending = false;
+                if (FAILED(output1->DuplicateOutput(d3dDev.Get(), &dupl))) {
+                    Sleep(20);
+                    continue;
+                }
+                DXGI_OUTDUPL_DESC d2{};
+                dupl->GetDesc(&d2);
+                UINT nw = d2.ModeDesc.Width, nh = d2.ModeDesc.Height;
+                lastMouseStamp = 0;
+                cursorInit = false;
+                if (nw != texW || nh != texH) {
+                    bool autoRes = (cfg.outWidth == 0 && cfg.outHeight == 0);
+                    if (autoRes) {
+                        m_statSegSum.store(m_statSegSum.load() + (double)writeCount * frameDurHns);
+                        m_statSegs.fetch_add(1);
+                        if (m_mic.IsRunning()) m_mic.Stop();
+                        if (m_audio.IsRunning()) m_audio.Stop();
+                        if (writer.Get() && wroteAny) writer->Finalize();
+                        writer.Reset();
+                        texW = nw; texH = nh;
+                        outW = texW; outH = texH;
+                        hr = CreateCaptureTextures(texW, texH);
+                        if (FAILED(hr)) { err = "CreateTexture2D staging"; failHR = (DWORD)hr; goto cleanup; }
+                        pendingScale = false; modeTex.Reset(); modeBmp.Reset();
+                        curFile = MakeAutoFilename(cfg.format);
+                        g_cfg.outputFile = curFile;
+                        hr = CreateVideoWriter(texW, texH, outW, outH, Utf8ToWide(curFile));
+                        if (FAILED(hr)) { err = "nao foi possivel reiniciar o encoder"; failHR = (DWORD)hr; goto cleanup; }
+                        if (useSysAudio && audioStreamIdx > 0) {
+                            if (!m_audio.Start(writer.Get(), audioStreamIdx)) { useSysAudio = false; audioStreamIdx = 0; }
+                        }
+                        if (useMic && micStreamIdx > 0) {
+                            if (!m_mic.Start(writer.Get(), micStreamIdx, cfg.micId)) { useMic = false; micStreamIdx = 0; }
+                        }
+                        writeCount = 0;
+                        QueryPerformanceCounter(&t0);
+                        haveNew = false; wroteAny = false;
+                        m_statFirst.store(0.0); m_statLast.store(0.0);
+                        segCount++;
+                        cout << "\n resolucao alterada para " << texW << "x" << texH << " - continuando em novo arquivo: " << curFile << "\n";
+                    }
+                    else {
+                        if (!d2dOk) { err = "resolucao do monitor mudou durante a gravacao"; goto cleanup; }
+                        D3D11_TEXTURE2D_DESC md{};
+                        md.Width = nw; md.Height = nh; md.MipLevels = 1; md.ArraySize = 1;
+                        md.Format = DXGI_FORMAT_B8G8R8A8_UNORM; md.SampleDesc.Count = 1;
+                        md.Usage = D3D11_USAGE_DEFAULT;
+                        md.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+                        modeTex.Reset(); modeBmp.Reset();
+                        hr = d3dDev->CreateTexture2D(&md, nullptr, &modeTex);
+                        if (FAILED(hr)) { err = "CreateTexture2D modeTex"; failHR = (DWORD)hr; goto cleanup; }
+                        ComPtr<IDXGISurface> msurf;
+                        if (FAILED(modeTex->QueryInterface(__uuidof(IDXGISurface), (void**)&msurf))) { err = "modeTex surface"; goto cleanup; }
+                        D2D1_BITMAP_PROPERTIES1 mbp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
+                        if (FAILED(d2dCtx->CreateBitmapFromDxgiSurface(msurf.Get(), &mbp, &modeBmp))) { err = "modeBmp"; goto cleanup; }
+                        pendingScale = true;
+                        haveNew = false;
+                        cout << "\n resolucao do monitor mudou para " << nw << "x" << nh << " - saida mantida em " << outW << "x" << outH << "\n";
+                    }
+                }
+            }
+
+            hr = dupl->AcquireNextFrame(1, &frameInfo, &res);
+            if (hr == S_OK) {
+                framePending = true;
+                if (d2dOk && cfg.showCursor) {
+                    bool timeChanged = (frameInfo.LastMouseUpdateTime.QuadPart != lastMouseStamp);
+                    bool posChanged = (frameInfo.PointerPosition.Position.x != cursorX) ||
+                        (frameInfo.PointerPosition.Position.y != cursorY);
+                    bool visChanged = ((frameInfo.PointerPosition.Visible != FALSE) != cursorVisible);
+                    if (timeChanged || posChanged || visChanged) {
+                        if (timeChanged) lastMouseStamp = frameInfo.LastMouseUpdateTime.QuadPart;
+                        CURSORINFO ci{};
+                        ci.cbSize = sizeof(CURSORINFO);
+                        bool win32Visible = GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor;
+                        bool dxgiVisible = frameInfo.PointerPosition.Visible != FALSE;
+                        if (win32Visible && dxgiVisible) {
+                            cursorInit = true;
+                            cursorVisible = true;
+                            cursorX = frameInfo.PointerPosition.Position.x;
+                            cursorY = frameInfo.PointerPosition.Position.y;
+                            if (ci.hCursor != lastCur) {
+                                lastCur = ci.hCursor;
+                                if (!DecodeCursor(ci.hCursor, dcur)) dcur.w = 0;
+                                if (dcur.w > 0) {
+                                    D2D1_BITMAP_PROPERTIES1 cbp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
+                                    D2D1_SIZE_U sz = { (UINT)dcur.w, (UINT)dcur.h };
+                                    curBmp.Reset();
+                                    d2dCtx->CreateBitmap(sz, dcur.px.data(), dcur.w * 4, &cbp, &curBmp);
+                                }
+                            }
+                        }
+                        else if (!win32Visible && !dxgiVisible) {
+                            cursorVisible = false;
+                        }
+                    }
+                }
+                stageIdx = (stageIdx + 1) % RING;
+                frameTex.Reset();
+                res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frameTex);
+                if (frameTex.Get()) {
+                    ctx->CopyResource(staging[stageIdx].Get(), frameTex.Get());
+                    if (pendingScale && modeTex.Get()) ctx->CopyResource(modeTex.Get(), frameTex.Get());
+                }
+                frameTex.Reset();
+                res.Reset();
+                dupl->ReleaseFrame();
+                framePending = false;
+                haveNew = true;
+            }
+            else if (hr == DXGI_ERROR_WAIT_TIMEOUT) {
+            }
+            else if (hr == DXGI_ERROR_ACCESS_LOST || hr == DXGI_ERROR_INVALID_CALL || hr == E_ACCESSDENIED) {
+                if (framePending && dupl.Get()) {
+                    dupl->ReleaseFrame();
+                    framePending = false;
+                }
+                dupl.Reset();
+            }
+            else {
+                if (framePending && dupl.Get()) {
+                    dupl->ReleaseFrame();
+                    framePending = false;
+                }
+                err = "AcquireNextFrame falhou";
+                failHR = (DWORD)hr;
+                goto cleanup;
+            }
+
             QueryPerformanceCounter(&now);
             elapsedHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
             double dueTs = (double)writeCount * frameDurHns;
-            if (wroteAny && elapsedHns - dueTs > 20'000'000.0) {
-                UINT skip = (UINT)(elapsedHns / frameDurHns) - (UINT)cfg.fps - writeCount;
-                writeCount = (UINT)(elapsedHns / frameDurHns) - (UINT)cfg.fps;
-                dueTs = (double)writeCount * frameDurHns;
-                cout << "\n travada longa detectada: " << skip << " frames descartados\n";
-            }
-            if ((haveNew || wroteAny) && elapsedHns >= dueTs) {
-                wIdx = (lastWIdx + 1) & 7;
+
+            if (elapsedHns >= dueTs && (haveNew || wroteAny)) {
+                wIdx = (wIdx + 1) % RING;
                 ctx->CopyResource(wtex[wIdx].Get(), (pendingScale && modeTex.Get()) ? modeTex.Get() : staging[stageIdx].Get());
                 if (d2dOk) {
                     d2dCtx->SetTarget(frameBmp[wIdx].Get());
@@ -597,7 +990,6 @@ private:
                             if (FAILED(d2dDevice->CreateDeviceContext(D2D1_DEVICE_CONTEXT_OPTIONS_NONE, &d2dCtx))) break;
                             d2dOk = true;
                         } while (false);
-                        if (d2dOk && FAILED(CreateCaptureTextures(texW, texH))) d2dOk = false;
                         if (!d2dOk) cout << "\n cursor: falha de dispositivo D2D - gravando sem cursor\n";
                     }
                 }
@@ -651,7 +1043,7 @@ private:
                 if (SUCCEEDED(hr)) hr = sample->SetSampleTime((LONGLONG)ts);
                 if (SUCCEEDED(hr)) hr = sample->SetSampleDuration((LONGLONG)frameDurHns);
                 if (FAILED(hr)) { err = "criacao do sample"; failHR = (DWORD)hr; goto cleanup; }
-                hr = writer->WriteSample(streamIdx, sample.Get());
+                hr = writer->WriteSample(videoStreamIdx, sample.Get());
                 if (FAILED(hr)) {
                     if (!wroteAny) {
                         useRam = true;
@@ -666,117 +1058,28 @@ private:
                     }
                 }
                 else {
-                    writeCount++;
-                    wroteAny = true;
-                    lastWIdx = wIdx;
-                    if (m_statSamples.load() == 0 && m_statFirst.load() <= 0.0) m_statFirst.store(ts);
+                    if (m_statFirst.load() <= 0.0) m_statFirst.store(ts);
                     m_statLast.store(ts);
                     m_statSamples++;
+                    wroteAny = true;
+                    writeCount++;
+                    haveNew = false;
                 }
-                haveNew = false;
             }
-            else {
-                double dueW = (double)writeCount * frameDurHns;
-                if (dueW > elapsedHns) {
-                    LARGE_INTEGER tgt{};
-                    tgt.QuadPart = t0.QuadPart + (LONGLONG)(dueW * (double)qpf.QuadPart / 10'000'000.0);
-                    SleepUntilQpc(tgt, qpf);
-                    QueryPerformanceCounter(&now);
-                    elapsedHns = (double)(now.QuadPart - t0.QuadPart) * 10'000'000.0 / (double)qpf.QuadPart;
-                }
-                hr = dupl->AcquireNextFrame(0, &frameInfo, &res);
-                if (hr == DXGI_ERROR_WAIT_TIMEOUT) continue;
-                else if (hr == S_OK) {
-                    if (d2dOk && cfg.showCursor && frameInfo.LastMouseUpdateTime.QuadPart != lastMouseStamp) {
-                        lastMouseStamp = frameInfo.LastMouseUpdateTime.QuadPart;
-                        cursorInit = true;
-                        cursorVisible = frameInfo.PointerPosition.Visible != FALSE;
-                        cursorX = frameInfo.PointerPosition.Position.x;
-                        cursorY = frameInfo.PointerPosition.Position.y;
-                        CURSORINFO ci{};
-                        ci.cbSize = sizeof(CURSORINFO);
-                        if (GetCursorInfo(&ci) && (ci.flags & CURSOR_SHOWING) && ci.hCursor) {
-                            if (ci.hCursor != lastCur) {
-                                lastCur = ci.hCursor;
-                                if (!DecodeCursor(ci.hCursor, dcur)) dcur.w = 0;
-                                if (dcur.w > 0) {
-                                    D2D1_BITMAP_PROPERTIES1 cbp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED));
-                                    D2D1_SIZE_U sz = { (UINT)dcur.w, (UINT)dcur.h };
-                                    curBmp.Reset();
-                                    d2dCtx->CreateBitmap(sz, dcur.px.data(), dcur.w * 4, &cbp, &curBmp);
-                                }
-                            }
-                        }
-                        else {
-                            cursorVisible = false;
-                        }
-                    }
-                    stageIdx = (stageIdx + 1) & 7;
-                    frameTex.Reset();
-                    res->QueryInterface(__uuidof(ID3D11Texture2D), (void**)&frameTex);
-                    ctx->CopyResource(staging[stageIdx].Get(), frameTex.Get());
-                    if (pendingScale && modeTex.Get()) ctx->CopyResource(modeTex.Get(), frameTex.Get());
-                    frameTex.Reset();
-                    res.Reset();
-                    dupl->ReleaseFrame();
-                    haveNew = true;
-                }
-                else if (hr == DXGI_ERROR_ACCESS_LOST || hr == E_ACCESSDENIED) {
-                    dupl.Reset();
-                    haveNew = true;
-                    Sleep(hr == E_ACCESSDENIED ? 250 : 100);
-                    if (FAILED(output1->DuplicateOutput(d3dDev.Get(), &dupl))) continue;
-                    DXGI_OUTDUPL_DESC d2{};
-                    dupl->GetDesc(&d2);
-                    UINT nw = d2.ModeDesc.Width, nh = d2.ModeDesc.Height;
-                    if (nw == texW && nh == texH) continue;
-                    bool autoRes = (cfg.outWidth == 0 && cfg.outHeight == 0);
-                    if (autoRes) {
-                        m_statSegSum.store(m_statSegSum.load() + (double)writeCount * frameDurHns);
-                        m_statSegs.fetch_add(1);
-                        if (writer.Get() && wroteAny) writer->Finalize();
-                        writer.Reset();
-                        texW = nw; texH = nh;
-                        outW = texW; outH = texH;
-                        hr = CreateCaptureTextures(texW, texH);
-                        if (FAILED(hr)) { err = "CreateTexture2D staging"; failHR = (DWORD)hr; goto cleanup; }
-                        pendingScale = false; modeTex.Reset(); modeBmp.Reset();
-                        g_cfg.outputFile = MakeAutoFilename(cfg.format);
-                        hr = CreateVideoWriter(texW, texH, outW, outH, Utf8ToWide(g_cfg.outputFile));
-                        if (FAILED(hr)) { err = "nao foi possivel reiniciar o encoder apos mudanca de resolucao"; failHR = (DWORD)hr; goto cleanup; }
-                        writeCount = 0;
-                        QueryPerformanceCounter(&t0);
-                        haveNew = false; wroteAny = false;
-                        m_statFirst.store(0.0); m_statLast.store(0.0);
-                        segCount++;
-                        cout << "\n resolucao alterada para " << texW << "x" << texH << " - continuando em novo arquivo: " << g_cfg.outputFile << "\n";
-                    }
-                    else {
-                        if (!d2dOk) { err = "resolucao do monitor mudou durante a gravacao"; goto cleanup; }
-                        D3D11_TEXTURE2D_DESC md{};
-                        md.Width = nw; md.Height = nh; md.MipLevels = 1; md.ArraySize = 1;
-                        md.Format = DXGI_FORMAT_B8G8R8A8_UNORM; md.SampleDesc.Count = 1;
-                        md.Usage = D3D11_USAGE_DEFAULT;
-                        md.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
-                        modeTex.Reset(); modeBmp.Reset();
-                        hr = d3dDev->CreateTexture2D(&md, nullptr, &modeTex);
-                        if (FAILED(hr)) { err = "CreateTexture2D modeTex"; failHR = (DWORD)hr; goto cleanup; }
-                        ComPtr<IDXGISurface> msurf;
-                        if (FAILED(modeTex->QueryInterface(__uuidof(IDXGISurface), (void**)&msurf))) { err = "modeTex surface"; goto cleanup; }
-                        D2D1_BITMAP_PROPERTIES1 mbp = D2D1::BitmapProperties1(D2D1_BITMAP_OPTIONS_NONE, D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE));
-                        if (FAILED(d2dCtx->CreateBitmapFromDxgiSurface(msurf.Get(), &mbp, &modeBmp))) { err = "modeBmp"; goto cleanup; }
-                        pendingScale = true;
-                        cout << "\n resolucao do monitor mudou para " << nw << "x" << nh << " - saida mantida em " << outW << "x" << outH << "\n";
-                    }
-                }
-                else { err = "AcquireNextFrame falhou"; failHR = (DWORD)hr; goto cleanup; }
+            else if (elapsedHns < dueTs) {
+                double waitHns = dueTs - elapsedHns;
+                double waitMs = waitHns / 10000.0;
+                if (waitMs > 2.0) waitMs = 2.0;
+                if (waitMs > 0.3) Sleep((DWORD)waitMs);
             }
         }
     cleanup:
+        if (m_mic.IsRunning()) m_mic.Stop();
+        if (m_audio.IsRunning()) m_audio.Stop();
         if (!wroteAny) {
             if (err.empty()) err = "nenhum frame capturado - gravacao parada antes do primeiro frame";
             writer.Reset();
-            DeleteFileW(Utf8ToWide(cfg.outputFile).c_str());
+            DeleteFileW(Utf8ToWide(curFile).c_str());
         }
         else if (writer.Get()) {
             HRESULT hf = writer->Finalize();
@@ -787,9 +1090,9 @@ private:
         attrs.Reset();
         writer.Reset();
         dxgiMan.Reset();
-        for (int i = 0; i < 8; i++) staging[i].Reset();
+        for (int i = 0; i < RING; i++) staging[i].Reset();
         cpuStage.Reset();
-        for (int i = 0; i < 8; i++) { frameBmp[i].Reset(); wtex[i].Reset(); }
+        for (int i = 0; i < RING; i++) { frameBmp[i].Reset(); wtex[i].Reset(); }
         modeTex.Reset(); modeBmp.Reset();
         curBmp.Reset();
         d2dCtx.Reset();
@@ -816,6 +1119,8 @@ private:
     atomic<bool> m_stopFlag{ false };
     chrono::steady_clock::time_point m_startTime;
     string m_lastError;
+    AudioCapture m_audio{ false };
+    AudioCapture m_mic{ true };
 };
 
 ScreenRecorder g_recorder;
@@ -837,7 +1142,9 @@ static void RecordingScreen() {
     SetColor(kTitle); cout << "==================================================\n";
     SetColor(kGray);
     cout << " Arquivo: " << g_cfg.outputFile << "\n";
-    cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | " << g_cfg.format << " | " << ResLabel() << "\n";
+    cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | " << g_cfg.format << " | " << ResLabel()
+        << " | audio " << (g_cfg.audioEnabled ? "Sim" : "Nao")
+        << " | mic " << (g_cfg.micEnabled ? "Sim" : "Nao") << "\n";
     SetColor(kTitle); cout << "--------------------------------------------------\n";
     SetColor(kGray); cout << " Duracao: " << flush;
     CONSOLE_SCREEN_BUFFER_INFO csbi{};
@@ -854,7 +1161,7 @@ static void RecordingScreen() {
         int c = -1;
         if (_kbhit()) {
             c = _getch();
-            if (c == 0 || c == 224) { if (_kbhit()) _getch(); c = -1; }
+            if (c == 0 || c == 224) { if (_kbhit()) (void)_getch(); c = -1; }
         }
         if (IsEnter(c) || IsEsc(c)) break;
         int sec = (int)g_recorder.ElapsedSeconds();
@@ -869,33 +1176,9 @@ static void RecordingScreen() {
         }
         Sleep(50);
     }
-    double dur = g_recorder.ElapsedSeconds();
     g_recorder.Stop();
-    int nS = g_recorder.StatSamples();
-    double t0 = g_recorder.StatFirst(), t1 = g_recorder.StatLast();
-    double tl = g_recorder.StatSegSum() / 10000000.0 + ((t0 > 0.0 ? t1 - t0 : t1) / 10000000.0);
-    int segs = g_recorder.StatSegs();
-    ClearScreen();
-    cout << "\n\n";
-    if (!g_recorder.LastError().empty()) {
-        SetColor(kErr);
-        cout << " Gravacao interrompida com erro:\n " << g_recorder.LastError() << "\n\n";
-    }
-    else {
-        SetColor(kOk);
-        cout << " Recording stopped.\n Duracao: " << FormatClock(dur) << "\n Arquivo salvo: " << g_cfg.outputFile << "\n\n";
-    }
-    SetColor(kGray);
-    cout << " frames: " << nS << " | timeline: " << fixed << setprecision(1) << tl << " s | tempo real: " << dur << " s\n";
-    cout << " media: " << (tl > 0 ? (double)nS / tl : 0.0) << " fps no arquivo\n";
-    if (segs > 1) cout << " arquivos gerados: " << segs << " - a duracao soma todos\n";
-    cout << "\n";
-    SetColor(kDim);
-    cout << " Press any key...";
-    SetColor(kGray);
-    cout << flush;
-    ReadKey();
 }
+    
 void startrecord() {
     if (g_recorder.IsRecording()) { MessageScreen("Recording is already running.", kAccent); return; }
     vector<MonitorInfo> mons = ListMonitors();
@@ -919,7 +1202,7 @@ static void ConfigPickMonitor() {
     vector<MonitorInfo> mons = ListMonitors();
     if (mons.empty()) { MessageScreen("Nenhum monitor detectado.", kErr); return; }
     vector<string> items;
-    for (size_t i = 0; i < mons.size(); i++) items.push_back("Monitor " + to_string(i) + "  - " + mons[i].nameUtf8);
+    for (size_t i = 0; i < mons.size(); i++) items.push_back("Monitor " + to_string(i) + "  -  " + mons[i].nameUtf8);
     int r = SelectFromList("SELECIONE O MONITOR", items, g_cfg.monitor);
     if (r >= 0 && r != g_cfg.monitor) { g_cfg.monitor = r; SaveConfig(); }
 }
@@ -978,8 +1261,77 @@ static void ConfigPickResolution() {
     g_cfg.outHeight = RH[r];
     SaveConfig();
 }
+
+static void ConfigAudioMenu() {
+    int sel = 0;
+    const int N = 5;
+    while (true) {
+        ClearScreen();
+        SetColor(kTitle); cout << "=== AUDIO ===\n\n";
+        string micLabel = "Padrao do Windows";
+        if (!g_cfg.micId.empty()) {
+            auto mics = ListAudioDevices(eCapture);
+            bool found = false;
+            for (auto& m : mics) {
+                if (m.id == g_cfg.micId) { micLabel = m.nameUtf8; found = true; break; }
+            }
+            if (!found) micLabel = "(desconectado)";
+        }
+        vector<string> items;
+        items.push_back(string("Audio do Sistema   :  ") + (g_cfg.audioEnabled ? "Sim" : "Nao"));
+        items.push_back(string("Gravar Microfone   :  ") + (g_cfg.micEnabled ? "Sim" : "Nao"));
+        items.push_back("Dispositivo Mic    :  " + micLabel);
+        items.push_back("Listar dispositivos");
+        items.push_back("Voltar");
+        DrawItems(items, sel);
+        DrawFooter("[ESC] voltar");
+        int c = ReadKey();
+        if (IsUp(c)) sel = (sel + N - 1) % N;
+        else if (IsDown(c)) sel = (sel + 1) % N;
+        else if (IsEsc(c)) return;
+        else if (IsEnter(c)) {
+            switch (sel) {
+            case 0: g_cfg.audioEnabled = !g_cfg.audioEnabled; SaveConfig(); break;
+            case 1: g_cfg.micEnabled = !g_cfg.micEnabled; SaveConfig(); break;
+            case 2: {
+                auto mics = ListAudioDevices(eCapture);
+                if (mics.empty()) { MessageScreen("Nenhum microfone detectado.", kErr); break; }
+                vector<string> mlist;
+                mlist.push_back("Padrao do Windows");
+                for (auto& m : mics) mlist.push_back(m.nameUtf8 + (m.isDefault ? "  (padrao)" : ""));
+                int r = SelectFromList("SELECIONE O MICROFONE", mlist, 0);
+                if (r >= 0) {
+                    if (r == 0) g_cfg.micId.clear();
+                    else g_cfg.micId = mics[r - 1].id;
+                    SaveConfig();
+                }
+                break;
+            }
+            case 3: {
+                auto mics = ListAudioDevices(eCapture);
+                auto spks = ListAudioDevices(eRender);
+                ClearScreen();
+                SetColor(kTitle); cout << "=== DISPOSITIVOS DE AUDIO ===\n\n";
+                SetColor(kGray);
+                cout << " Microfones (" << mics.size() << "):\n";
+                for (size_t i = 0; i < mics.size(); i++) cout << "   [" << i << "] " << mics[i].nameUtf8 << (mics[i].isDefault ? "  (padrao)" : "") << "\n";
+                cout << "\n Saidas (" << spks.size() << "):\n";
+                for (size_t i = 0; i < spks.size(); i++) cout << "   [" << i << "] " << spks[i].nameUtf8 << (spks[i].isDefault ? "  (padrao)" : "") << "\n";
+                SetColor(kDim);
+                cout << "\n Press any key...";
+                SetColor(kGray);
+                cout << flush;
+                (void)ReadKey();
+                break;
+            }
+            case 4: return;
+            }
+        }
+    }
+}
+
 void openconfig() {
-    const int N = 7;
+    const int N = 8;
     int sel = 0;
     while (true) {
         ClearScreen();
@@ -993,6 +1345,7 @@ void openconfig() {
         items.push_back("Resolucao saida    :  " + ResLabel());
         items.push_back("Formato de video   :  " + g_cfg.format);
         items.push_back(string("Mostrar Cursor     :  ") + (g_cfg.showCursor ? "Sim" : "Nao"));
+        items.push_back("Configurar Audio...");
         items.push_back("Voltar");
         DrawItems(items, sel);
         DrawFooter("[ESC] voltar");
@@ -1008,7 +1361,8 @@ void openconfig() {
             case 3: ConfigPickResolution(); break;
             case 4: g_cfg.format = (g_cfg.format == "mp4") ? "wmv" : "mp4"; SaveConfig(); break;
             case 5: g_cfg.showCursor = !g_cfg.showCursor; SaveConfig(); break;
-            case 6: return;
+            case 6: ConfigAudioMenu(); break;
+            case 7: return;
             }
         }
     }
@@ -1023,7 +1377,10 @@ void mainmenu() {
         SetColor(kTitle); cout << "==================================================\n";
         SetColor(kGray);
         cout << " Status : " << (g_recorder.IsRecording() ? "RECORDING" : "STOPPED") << "\n";
-        cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | monitor " << g_cfg.monitor << " | " << ResLabel() << " | " << g_cfg.format << " | cursor " << (g_cfg.showCursor ? "Sim" : "Nao") << "\n";
+        cout << " Config : " << g_cfg.fps << " fps | " << g_cfg.bitrateKbps << " kbps | monitor " << g_cfg.monitor << " | " << ResLabel() << " | " << g_cfg.format
+            << " | cursor " << (g_cfg.showCursor ? "Sim" : "Nao")
+            << " | audio " << (g_cfg.audioEnabled ? "Sim" : "Nao")
+            << " | mic " << (g_cfg.micEnabled ? "Sim" : "Nao") << "\n";
         cout << " Arquivo: " << MakeAutoFilename(g_cfg.format) << "\n";
         if (!g_recorder.LastError().empty()) { SetColor(kErr); cout << " Ultimo erro: " << g_recorder.LastError() << "\n"; SetColor(kGray); }
         SetColor(kTitle); cout << "--------------------------------------------------\n\n";
@@ -1049,9 +1406,11 @@ void mainmenu() {
 }
 int main() {
     timeBeginPeriod(1);
+    HRESULT hrCo = CoInitializeEx(nullptr, COINIT_APARTMENTTHREADED);
     LoadConfig();
     SetConsoleCtrlHandler(CtrlHandler, TRUE);
     mainmenu();
     timeEndPeriod(1);
+    if (SUCCEEDED(hrCo)) CoUninitialize();
     return 0;
 }
