@@ -35,6 +35,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <mutex>
 #ifdef _MSC_VER
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "d3d10.lib")
@@ -164,12 +165,6 @@ static void DrawFooter(const string& extra = "") {
     cout << "\n";
     SetColor(kGray);
 }
-static string FormatClock(double s) {
-    int total = (int)s, mm = total / 60, ss = total % 60, dec = (int)((s - (double)total) * 10.0);
-    ostringstream os;
-    os << setw(2) << setfill('0') << mm << ":" << setw(2) << setfill('0') << ss << "." << dec;
-    return os.str();
-}
 static void MessageScreen(const string& msg, WORD color = kGray) {
     ClearScreen();
     cout << "\n\n ";
@@ -262,7 +257,7 @@ static vector<AudioDeviceInfo> ListAudioDevices(EDataFlow flow) {
         if (SUCCEEDED(defDev->GetId(&did))) { defId = did; CoTaskMemFree(did); }
     }
     ComPtr<IMMDeviceCollection> col;
-    if (FAILED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE, &col))) return out;
+    if (FAILED(en->EnumAudioEndpoints(flow, DEVICE_STATE_ACTIVE | DEVICE_STATE_UNPLUGGED, &col))) return out;
     UINT count = 0;
     col->GetCount(&count);
     for (UINT i = 0; i < count; i++) {
@@ -400,16 +395,42 @@ static bool DecodeCursor(HICON hc, DecodedCursor& dc) {
     return ok;
 }
 
+struct AudioBuffer {
+    vector<BYTE> data;
+    mutex mtx;
+    void Push(const BYTE* src, size_t bytes) {
+        lock_guard<mutex> lk(mtx);
+        data.insert(data.end(), src, src + bytes);
+        const size_t MAX = 48000 * 4 * 2;
+        if (data.size() > MAX) data.erase(data.begin(), data.begin() + (data.size() - MAX));
+    }
+    size_t Available() {
+        lock_guard<mutex> lk(mtx);
+        return data.size();
+    }
+    size_t Pop(BYTE* dst, size_t bytes) {
+        lock_guard<mutex> lk(mtx);
+        size_t n = min(bytes, data.size());
+        if (n > 0) {
+            memcpy(dst, data.data(), n);
+            data.erase(data.begin(), data.begin() + n);
+        }
+        return n;
+    }
+    void Clear() { lock_guard<mutex> lk(mtx); data.clear(); }
+};
+
 class AudioCapture {
 public:
     explicit AudioCapture(bool isMic) : m_isMic(isMic) {}
-    bool Start(IMFSinkWriter* writer, DWORD streamIdx, const wstring& deviceId = L"") {
+    bool Start(IMFSinkWriter* writer, DWORD streamIdx, const wstring& deviceId, AudioBuffer* buffer = nullptr) {
         if (m_running.load()) return false;
         if (m_thread.joinable()) m_thread.join();
         m_stopFlag.store(false);
         m_writer = writer;
         m_streamIdx = streamIdx;
         m_deviceId = deviceId;
+        m_buffer = buffer;
         m_lastError.clear();
         try {
             m_thread = thread(&AudioCapture::ThreadProc, this);
@@ -506,23 +527,35 @@ private:
                     if (FAILED(hr)) break;
 
                     UINT32 bytes = numFrames * 4;
-                    ComPtr<IMFMediaBuffer> buf;
-                    if (SUCCEEDED(MFCreateMemoryBuffer(bytes, &buf))) {
-                        BYTE* dst = nullptr;
-                        if (SUCCEEDED(buf->Lock(&dst, nullptr, nullptr))) {
-                            if (flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(dst, 0, bytes);
-                            else memcpy(dst, data, bytes);
-                            buf->Unlock();
-                            buf->SetCurrentLength(bytes);
 
-                            ComPtr<IMFSample> sample;
-                            if (SUCCEEDED(MFCreateSample(&sample))) {
-                                sample->AddBuffer(buf.Get());
-                                LONGLONG ts = (samplePos * 10000000LL) / 48000;
-                                LONGLONG dur = ((LONGLONG)numFrames * 10000000LL) / 48000;
-                                sample->SetSampleTime(ts);
-                                sample->SetSampleDuration(dur);
-                                m_writer->WriteSample(m_streamIdx, sample.Get());
+                    if (m_buffer) {
+                        if (flags & AUDCLNT_BUFFERFLAGS_SILENT) {
+                            vector<BYTE> zeros(bytes, 0);
+                            m_buffer->Push(zeros.data(), bytes);
+                        }
+                        else {
+                            m_buffer->Push(data, bytes);
+                        }
+                    }
+                    else if (m_writer) {
+                        ComPtr<IMFMediaBuffer> buf;
+                        if (SUCCEEDED(MFCreateMemoryBuffer(bytes, &buf))) {
+                            BYTE* dst = nullptr;
+                            if (SUCCEEDED(buf->Lock(&dst, nullptr, nullptr))) {
+                                if (flags & AUDCLNT_BUFFERFLAGS_SILENT) memset(dst, 0, bytes);
+                                else memcpy(dst, data, bytes);
+                                buf->Unlock();
+                                buf->SetCurrentLength(bytes);
+
+                                ComPtr<IMFSample> sample;
+                                if (SUCCEEDED(MFCreateSample(&sample))) {
+                                    sample->AddBuffer(buf.Get());
+                                    LONGLONG ts = (samplePos * 10000000LL) / 48000;
+                                    LONGLONG dur = ((LONGLONG)numFrames * 10000000LL) / 48000;
+                                    sample->SetSampleTime(ts);
+                                    sample->SetSampleDuration(dur);
+                                    m_writer->WriteSample(m_streamIdx, sample.Get());
+                                }
                             }
                         }
                     }
@@ -549,6 +582,147 @@ private:
     DWORD m_streamIdx = 0;
     bool m_isMic = false;
     wstring m_deviceId;
+    AudioBuffer* m_buffer = nullptr;
+    string m_lastError;
+};
+
+class AudioMixer {
+public:
+    bool Start(IMFSinkWriter* writer, DWORD streamIdx, bool useSys, const wstring& sysId, bool useMic, const wstring& micId) {
+        if (m_running.load()) return false;
+        m_writer = writer;
+        m_streamIdx = streamIdx;
+        m_useSys = useSys;
+        m_useMic = useMic;
+        m_stopFlag.store(false);
+        m_lastError.clear();
+        m_sysBuf.Clear();
+        m_micBuf.Clear();
+
+        if (useSys) {
+            if (!m_sys.Start(nullptr, 0, sysId, &m_sysBuf)) {
+                m_lastError = "sys: " + m_sys.LastError();
+                return false;
+            }
+        }
+        if (useMic) {
+            if (!m_mic.Start(nullptr, 0, micId, &m_micBuf)) {
+                if (useSys) m_sys.Stop();
+                m_lastError = "mic: " + m_mic.LastError();
+                return false;
+            }
+        }
+
+        m_running.store(true);
+        try {
+            m_mixThread = thread(&AudioMixer::MixLoop, this);
+        }
+        catch (...) {
+            m_stopFlag.store(true);
+            m_sys.Stop();
+            m_mic.Stop();
+            m_running.store(false);
+            m_lastError = "falha ao criar thread de mixagem";
+            return false;
+        }
+        return true;
+    }
+
+    void Stop() {
+        if (!m_running.load()) return;
+        m_stopFlag.store(true);
+        if (m_mixThread.joinable()) m_mixThread.join();
+        m_sys.Stop();
+        m_mic.Stop();
+        m_running.store(false);
+    }
+
+    bool IsRunning() const { return m_running.load(); }
+    string LastError() const { return m_lastError; }
+
+private:
+    void MixLoop() {
+        CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+        DWORD taskIndex = 0;
+        HANDLE hMmcss = AvSetMmThreadCharacteristicsW(L"Audio", &taskIndex);
+
+        const int FRAMES = 480;
+        const int BYTES = FRAMES * 4;
+
+        vector<BYTE> sysChunk(BYTES);
+        vector<BYTE> micChunk(BYTES);
+        vector<BYTE> mixed(BYTES);
+        LONGLONG samplePos = 0;
+
+        while (!m_stopFlag.load()) {
+            bool sysReady = !m_useSys || m_sysBuf.Available() >= (size_t)BYTES;
+            bool micReady = !m_useMic || m_micBuf.Available() >= (size_t)BYTES;
+
+            if (!sysReady || !micReady) {
+                Sleep(1);
+                continue;
+            }
+
+            if (m_useSys) m_sysBuf.Pop(sysChunk.data(), BYTES);
+            if (m_useMic) m_micBuf.Pop(micChunk.data(), BYTES);
+
+            if (m_useSys && m_useMic) {
+                int16_t* a = (int16_t*)sysChunk.data();
+                int16_t* b = (int16_t*)micChunk.data();
+                int16_t* o = (int16_t*)mixed.data();
+                for (int i = 0; i < FRAMES * 2; i++) {
+                    int v = (int)a[i] + (int)b[i];
+                    if (v > 32767) v = 32767;
+                    if (v < -32768) v = -32768;
+                    o[i] = (int16_t)v;
+                }
+            }
+            else if (m_useSys) {
+                memcpy(mixed.data(), sysChunk.data(), BYTES);
+            }
+            else if (m_useMic) {
+                memcpy(mixed.data(), micChunk.data(), BYTES);
+            }
+            else {
+                Sleep(5);
+                continue;
+            }
+
+            ComPtr<IMFMediaBuffer> buf;
+            if (FAILED(MFCreateMemoryBuffer(BYTES, &buf))) continue;
+            BYTE* dst = nullptr;
+            if (FAILED(buf->Lock(&dst, nullptr, nullptr))) continue;
+            memcpy(dst, mixed.data(), BYTES);
+            buf->Unlock();
+            buf->SetCurrentLength(BYTES);
+
+            ComPtr<IMFSample> sample;
+            if (FAILED(MFCreateSample(&sample))) continue;
+            sample->AddBuffer(buf.Get());
+            LONGLONG ts = (samplePos * 10000000LL) / 48000;
+            LONGLONG dur = ((LONGLONG)FRAMES * 10000000LL) / 48000;
+            sample->SetSampleTime(ts);
+            sample->SetSampleDuration(dur);
+            m_writer->WriteSample(m_streamIdx, sample.Get());
+
+            samplePos += FRAMES;
+        }
+
+        if (hMmcss) AvRevertMmThreadCharacteristics(hMmcss);
+        CoUninitialize();
+    }
+
+    IMFSinkWriter* m_writer = nullptr;
+    DWORD m_streamIdx = 0;
+    bool m_useSys = false;
+    bool m_useMic = false;
+    atomic<bool> m_stopFlag{ false };
+    atomic<bool> m_running{ false };
+    AudioCapture m_sys{ false };
+    AudioCapture m_mic{ true };
+    AudioBuffer m_sysBuf;
+    AudioBuffer m_micBuf;
+    thread m_mixThread;
     string m_lastError;
 };
 
@@ -572,11 +746,6 @@ public:
         m_running.store(false);
     }
     bool IsRecording() const { return m_running.load(); }
-    int StatSamples() const { return m_statSamples.load(); }
-    double StatFirst() const { return m_statFirst.load(); }
-    double StatLast() const { return m_statLast.load(); }
-    double StatSegSum() const { return m_statSegSum.load(); }
-    int StatSegs() const { return m_statSegs.load(); }
     double ElapsedSeconds() const {
         if (!m_running.load()) return 0.0;
         return chrono::duration<double>(chrono::steady_clock::now() - m_startTime).count();
@@ -633,7 +802,6 @@ private:
         BYTE* dstp = nullptr;
         DWORD videoStreamIdx = 0;
         DWORD audioStreamIdx = 0;
-        DWORD micStreamIdx = 0;
         bool useSysAudio = false;
         bool useMic = false;
         UINT writeCount = 0;
@@ -744,9 +912,11 @@ private:
             if (FAILED(r)) return r;
 
             audioStreamIdx = 0;
-            micStreamIdx = 0;
-            if (useSysAudio) AddAacStream(w.Get(), &audioStreamIdx);
-            if (useMic) AddAacStream(w.Get(), &micStreamIdx);
+            if (useSysAudio || useMic) {
+                if (!AddAacStream(w.Get(), &audioStreamIdx)) {
+                    audioStreamIdx = 0;
+                }
+            }
 
             r = w->BeginWriting();
             if (FAILED(r)) return r;
@@ -808,18 +978,12 @@ private:
             wstring wfile = Utf8ToWide(curFile);
             hr = CreateVideoWriter(texW, texH, outW, outH, wfile);
             if (FAILED(hr)) { err = "nao foi possivel iniciar o encoder"; failHR = (DWORD)hr; goto cleanup; }
-            if (useSysAudio && audioStreamIdx > 0) {
-                if (!m_audio.Start(writer.Get(), audioStreamIdx)) {
-                    cout << "\n audio do sistema: falha (" << m_audio.LastError() << ") - continuando sem\n";
+            if ((useSysAudio || useMic) && audioStreamIdx > 0) {
+                if (!m_mixer.Start(writer.Get(), audioStreamIdx, useSysAudio, L"", useMic, cfg.micId)) {
+                    cout << "\n mixer de audio: falha (" << m_mixer.LastError() << ") - continuando sem audio\n";
                     useSysAudio = false;
-                    audioStreamIdx = 0;
-                }
-            }
-            if (useMic && micStreamIdx > 0) {
-                if (!m_mic.Start(writer.Get(), micStreamIdx, cfg.micId)) {
-                    cout << "\n microfone: falha (" << m_mic.LastError() << ") - continuando sem\n";
                     useMic = false;
-                    micStreamIdx = 0;
+                    audioStreamIdx = 0;
                 }
             }
         }
@@ -841,10 +1005,7 @@ private:
                 if (nw != texW || nh != texH) {
                     bool autoRes = (cfg.outWidth == 0 && cfg.outHeight == 0);
                     if (autoRes) {
-                        m_statSegSum.store(m_statSegSum.load() + (double)writeCount * frameDurHns);
-                        m_statSegs.fetch_add(1);
-                        if (m_mic.IsRunning()) m_mic.Stop();
-                        if (m_audio.IsRunning()) m_audio.Stop();
+                        if (m_mixer.IsRunning()) m_mixer.Stop();
                         if (writer.Get() && wroteAny) writer->Finalize();
                         writer.Reset();
                         texW = nw; texH = nh;
@@ -856,16 +1017,14 @@ private:
                         g_cfg.outputFile = curFile;
                         hr = CreateVideoWriter(texW, texH, outW, outH, Utf8ToWide(curFile));
                         if (FAILED(hr)) { err = "nao foi possivel reiniciar o encoder"; failHR = (DWORD)hr; goto cleanup; }
-                        if (useSysAudio && audioStreamIdx > 0) {
-                            if (!m_audio.Start(writer.Get(), audioStreamIdx)) { useSysAudio = false; audioStreamIdx = 0; }
-                        }
-                        if (useMic && micStreamIdx > 0) {
-                            if (!m_mic.Start(writer.Get(), micStreamIdx, cfg.micId)) { useMic = false; micStreamIdx = 0; }
+                        if ((useSysAudio || useMic) && audioStreamIdx > 0) {
+                            if (!m_mixer.Start(writer.Get(), audioStreamIdx, useSysAudio, L"", useMic, cfg.micId)) {
+                                useSysAudio = false; useMic = false; audioStreamIdx = 0;
+                            }
                         }
                         writeCount = 0;
                         QueryPerformanceCounter(&t0);
                         haveNew = false; wroteAny = false;
-                        m_statFirst.store(0.0); m_statLast.store(0.0);
                         segCount++;
                         cout << "\n resolucao alterada para " << texW << "x" << texH << " - continuando em novo arquivo: " << curFile << "\n";
                     }
@@ -1058,24 +1217,19 @@ private:
                     }
                 }
                 else {
-                    if (m_statFirst.load() <= 0.0) m_statFirst.store(ts);
-                    m_statLast.store(ts);
-                    m_statSamples++;
                     wroteAny = true;
                     writeCount++;
                     haveNew = false;
                 }
             }
             else if (elapsedHns < dueTs) {
-                double waitHns = dueTs - elapsedHns;
-                double waitMs = waitHns / 10000.0;
+                double waitMs = (dueTs - elapsedHns) / 10000.0;
                 if (waitMs > 2.0) waitMs = 2.0;
                 if (waitMs > 0.3) Sleep((DWORD)waitMs);
             }
         }
     cleanup:
-        if (m_mic.IsRunning()) m_mic.Stop();
-        if (m_audio.IsRunning()) m_audio.Stop();
+        if (m_mixer.IsRunning()) m_mixer.Stop();
         if (!wroteAny) {
             if (err.empty()) err = "nenhum frame capturado - gravacao parada antes do primeiro frame";
             writer.Reset();
@@ -1111,16 +1265,10 @@ private:
     }
     thread m_thread;
     atomic<bool> m_running{ false };
-    atomic<int> m_statSamples{ 0 };
-    atomic<double> m_statFirst{ 0.0 };
-    atomic<double> m_statLast{ 0.0 };
-    atomic<double> m_statSegSum{ 0.0 };
-    atomic<int> m_statSegs{ 1 };
     atomic<bool> m_stopFlag{ false };
     chrono::steady_clock::time_point m_startTime;
     string m_lastError;
-    AudioCapture m_audio{ false };
-    AudioCapture m_mic{ true };
+    AudioMixer m_mixer;
 };
 
 ScreenRecorder g_recorder;
@@ -1178,7 +1326,6 @@ static void RecordingScreen() {
     }
     g_recorder.Stop();
 }
-    
 void startrecord() {
     if (g_recorder.IsRecording()) { MessageScreen("Recording is already running.", kAccent); return; }
     vector<MonitorInfo> mons = ListMonitors();
