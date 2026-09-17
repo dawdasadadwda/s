@@ -353,9 +353,10 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
     return ::DefWindowProcW(hWnd, msg, wParam, lParam);
 }
 
-void HandleDrag(HWND hWnd, const ImVec2& p, const ImVec2& q, const ImVec2& bp, const ImVec2& bq) {
+void HandleDrag(HWND hWnd, const ImVec2& p, const ImVec2& q, const ImVec2& bp, const ImVec2& bq,
+    const ImVec2& fp, const ImVec2& fq) {
     const ImVec2 mouse = ImGui::GetIO().MousePos;
-    const bool overBtn = InRect(mouse, bp, bq);
+    const bool overBtn = InRect(mouse, bp, bq) || InRect(mouse, fp, fq);
 
     if (!s_dragging) {
         const bool overPanel = InRect(mouse, p, q);
@@ -504,6 +505,317 @@ void DrawPowerButton(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
 }
 
 // ---------------------------------------------------------------------------
+// Botão de INJECT do card direito — é o ÚNICO controle do card:
+//
+//              [  Inject Hide  |  (o->)  ]
+//                   245 x 40 px
+//
+// O botão tem DUAS zonas de clique:
+//   - SÍMBOLO (faixa da direita): ALTERNA a seleção entre "Inject Hide" e
+//     "Inject Normal" (o rótulo velho sai por cima, o novo entra por baixo, e
+//     o símbolo dá meia volta como feedback).
+//   - RESTO do botão: DISPARA o inject do modo selecionado, abre o MENU de
+//     progresso (spinner + etapa) e trava o botão por 4s mostrando
+//     "Inject Hide..." / "Inject Normal...".
+//
+// Hover: um CÍRCULO branco nasce no CENTRO do botão e cresce até cobrir tudo
+// (nos dois eixos, voltando ao centro quando o mouse sai); o rótulo e o
+// símbolo invertem de cor conforme o branco passa por baixo.
+// ---------------------------------------------------------------------------
+static int   s_injectMode = 0;      // 0 = "Inject Hide" | 1 = "Inject Normal"
+static int   s_injectPrev = 0;      // rótulo que está saindo
+static float s_injectAnim = 1.0f;   // 0..1 na troca (1 = parado, sem animação)
+static const char* kInjectLabels[2] = { "Inject Hide", "Inject Normal" };
+static float s_injectFill = 0.0f;   // cortina do hover: 0 = vazio | 1 = coberto
+static float s_injectBusy = 0.0f;   // segundos restantes de trava (0 = livre)
+static int   s_injectingMode = 0;   // modo que está sendo injetado agora
+
+// Menu de progresso (abre no clique de disparo e dura o mesmo tempo da trava)
+static const float kInjectWorkTime = 4.0f;   // duração (s): menu = trava do botão
+static bool  s_menuOpen = false;
+static float s_menuT = 0.0f;                 // tempo desde a abertura (s)
+
+// Maior tamanho de fonte (<= maxSize) que faz o texto caber na largura dada.
+static float FitTextSize(ImFont* font, const char* text, float maxSize, float availW) {
+    const float w = font->CalcTextSizeA(maxSize, FLT_MAX, 0.0f, text).x;
+    if (w <= availW || w <= 0.0f) return maxSize;
+    return maxSize * (availW / w);
+}
+
+// ---------------------------------------------------------------------------
+// Inversão de cor pela cortina CIRCULAR: o ImGui só tem clip retangular, então
+// o miolo claro/círculo é aproximado por FAIXAS de 1px de altura (mesma técnica
+// da máscara dos cantos do header). `paint(cor)` desenha o conteúdo.
+//   1) pinta tudo na cor clara (fora do círculo)
+//   2) repinta na cor escura, faixa por faixa, dentro do círculo
+// ---------------------------------------------------------------------------
+template <typename PaintFn>
+static void RevealByCircle(ImDrawList* draw, const ImVec2& c, float radius,
+    const ImVec2& bMin, const ImVec2& bMax, PaintFn paint) {
+    draw->PushClipRect(bMin, bMax, true);
+    paint(IM_COL32(255, 255, 255, 255));
+    draw->PopClipRect();
+
+    if (radius <= 0.5f) return;
+    const int y0 = (int)floorf(fmaxf(bMin.y, c.y - radius));
+    const int y1 = (int)ceilf(fminf(bMax.y, c.y + radius));
+    for (int y = y0; y < y1; ++y) {
+        const float dy = ((float)y + 0.5f) - c.y;
+        const float r2 = radius * radius - dy * dy;
+        if (r2 <= 0.0f) continue;
+        const float dx = sqrtf(r2);
+        const float x0 = fmaxf(c.x - dx, bMin.x);
+        const float x1 = fminf(c.x + dx, bMax.x);
+        if (x1 <= x0) continue;
+        draw->PushClipRect(ImVec2(x0, (float)y), ImVec2(x1, (float)y + 1.0f), true);
+        paint(IM_COL32(12, 12, 14, 255));
+        draw->PopClipRect();
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Spinner do menu: um arco de 270° girando.
+// ---------------------------------------------------------------------------
+static void DrawSpinner(ImDrawList* draw, const ImVec2& c, float r, float phase, ImU32 col) {
+    const int   seg = 28;
+    const float kSpan = 4.712389f;          // 270°
+    ImVec2 pts[seg + 1];
+    for (int i = 0; i <= seg; ++i) {
+        const float a = phase + kSpan * ((float)i / (float)seg);
+        pts[i] = ImVec2(c.x + cosf(a) * r, c.y + sinf(a) * r);
+    }
+    draw->AddPolyline(pts, seg + 1, col, 0, 2.0f);
+}
+
+// ---------------------------------------------------------------------------
+// Símbolo de ALTERNAR: dois arcos opostos, cada um com uma ponta de seta no
+// fim. Desenhado à mão (arcos amostrados + triângulos) em vez de usar um glifo
+// de fonte: fica nítido nesse tamanho e gira no próprio centro.
+// rot = rotação em radianos (o símbolo tem simetria de 180°, então terminar em
+// PI deixa o desenho idêntico ao inicial — nada de "pulo" no fim).
+// ---------------------------------------------------------------------------
+static void DrawSwapIcon(ImDrawList* draw, const ImVec2& c, float r, ImU32 col, float rot) {
+    const float kSpan = 112.0f * 0.0174533f;   // abertura de cada arco (rad)
+    // 180-112 = 68° de vão entre as duas partes
+    const float kHead = 2.6f;                  // tamanho da ponta de seta
+    const float kThick = 1.5f;                 // espessura do arco
+    const int   kSeg = 12;                     // segmentos por arco
+
+    for (int k = 0; k < 2; ++k) {
+        const float a0 = rot + (float)k * 3.14159265f;
+
+        ImVec2 pts[kSeg + 1];
+        for (int i = 0; i <= kSeg; ++i) {
+            const float a = a0 + kSpan * ((float)i / (float)kSeg);
+            pts[i] = ImVec2(c.x + cosf(a) * r, c.y + sinf(a) * r);
+        }
+        draw->AddPolyline(pts, kSeg + 1, col, 0, kThick);
+
+        // Ponta de seta no fim do arco, seguindo a tangente do movimento
+        const float a1 = a0 + kSpan;
+        const ImVec2 p(c.x + cosf(a1) * r, c.y + sinf(a1) * r);
+        const ImVec2 tg(-sinf(a1), cosf(a1));   // direção do movimento
+        const ImVec2 nr(cosf(a1), sinf(a1));    // normal (radial)
+        const ImVec2 apex(p.x + tg.x * kHead * 1.15f, p.y + tg.y * kHead * 1.15f);
+        const ImVec2 b1(p.x + nr.x * kHead * 0.62f, p.y + nr.y * kHead * 0.62f);
+        const ImVec2 b2(p.x - nr.x * kHead * 0.62f, p.y - nr.y * kHead * 0.62f);
+        draw->AddTriangleFilled(apex, b1, b2, col);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Cortina do hover: círculo branco que nasce no CENTRO do controle e cresce
+// (nos dois eixos) até cobrir o botão inteiro — inclusive os cantos, por isso o
+// raio final é a MEIA-DIAGONAL do retângulo. Devolve o raio atual, que é o que
+// o rótulo e o símbolo usam para inverter de cor.
+// ---------------------------------------------------------------------------
+static float CortinaCircle(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    float round, float& fill, float fillTime, bool active, bool pressed) {
+    const float dt = ImGui::GetIO().DeltaTime;
+    fill = Clamp01(fill + (active ? 1.0f : -1.0f) * dt / fillTime);
+    const float t = EaseSmooth(fill);
+
+    if (t > 0.01f) {                       // halo: 3 camadas por fora
+        for (int i = 3; i >= 1; --i) {
+            const float g = (float)i * 1.7f;
+            draw->AddRectFilled(ImVec2(mn.x - g, mn.y - g), ImVec2(mx.x + g, mx.y + g),
+                IM_COL32(255, 255, 255, (int)(t * 40.0f / (float)i)), round + g);
+        }
+    }
+
+    draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), round);   // base escura
+
+    const float W = mx.x - mn.x, H = mx.y - mn.y;
+    const float cxm = mn.x + W * 0.5f;     // centro do controle
+    const float cym = mn.y + H * 0.5f;
+    const float halfDiag = sqrtf((W * 0.5f) * (W * 0.5f) + (H * 0.5f) * (H * 0.5f)) + 1.0f;
+    const float radius = halfDiag * t;     // NASCE no centro e abre nos 2 eixos
+
+    if (radius > 0.5f) {
+        // O círculo é recortado pelo retângulo do controle: os cantos redondos
+        // continuam certos e o branco não vaza pra fora do botão.
+        draw->PushClipRect(mn, mx, true);
+        draw->AddCircleFilled(ImVec2(cxm, cym), radius,
+            pressed ? IM_COL32(235, 235, 235, 255) : IM_COL32(255, 255, 255, 255), 64);
+        if (t < 0.985f)                    // anel de luz na borda que avança
+            draw->AddCircle(ImVec2(cxm, cym), radius, IM_COL32(255, 255, 255, 130), 64, 1.5f);
+        draw->PopClipRect();
+    }
+
+    draw->AddRect(mn, mx, IM_COL32(255, 255, 255, (int)(70 + 175 * t)), round, 0, 1.0f);
+    return radius;
+}
+
+void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    ImVec2& outMin, ImVec2& outMax) {
+    const float kRound = 6.0f;         // canto redondo
+    const float kFillTime = 0.22f;     // tempo do círculo cobrir tudo (s)
+    const float kSize = 17.0f;         // rótulo (o auto-fit reduz se não couber)
+    const float kIconZone = 20.0f;     // faixa reservada p/ o símbolo (à direita)
+    const float kSwapTime = 0.26f;     // duração da troca de rótulo (s)
+    const float kBlockTime = kInjectWorkTime;   // trava depois de disparar (s)
+    const float kSpinTime = 1.8f;      // volta completa do símbolo enquanto injeta (s)
+
+    outMin = mn;                       // área do controle (p/ excluir do drag)
+    outMax = mx;
+
+    ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
+
+    // Trava em andamento? (desconta o tempo; 0 = livre)
+    if (s_injectBusy > 0.0f)
+        s_injectBusy = fmaxf(0.0f, s_injectBusy - ImGui::GetIO().DeltaTime);
+    const bool busy = s_injectBusy > 0.0f;
+
+    ImGui::SetCursorScreenPos(mn);
+    ImGui::InvisibleButton("##inject", ImVec2(mx.x - mn.x, mx.y - mn.y));
+    const bool hovered = ImGui::IsItemHovered() && !s_dragging;
+    const bool pressed = hovered && !busy && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+
+    // Zonas: a faixa da direita (kIconZone) é o SÍMBOLO = alterna a seleção;
+    // todo o resto do botão é o DISPARO do inject.
+    const bool overIcon = ImGui::GetIO().MousePos.x >= (mx.x - kIconZone);
+
+    // >>> CLIQUE — bloqueado enquanto s_injectBusy estiver rodando
+    if (ImGui::IsItemClicked() && !busy) {
+        if (overIcon) {
+            // --- símbolo: ALTERNA a seleção (Hide <-> Normal) ---
+            s_injectPrev = s_injectMode;
+            s_injectMode = 1 - s_injectMode;
+            s_injectAnim = 0.0f;
+        }
+        else {
+            // --- resto do botão: DISPARA o inject do modo selecionado ---
+            s_injectingMode = s_injectMode;   // congela o modo escolhido
+            s_injectBusy = kBlockTime;        // trava o botão por 4s
+            s_menuOpen = true;                // e abre o menu de progresso
+            s_menuT = 0.0f;
+            // TODO: dispara o inject de verdade aqui — use s_injectingMode
+            //       (0 = "Inject Hide", 1 = "Inject Normal") p/ saber qual modo.
+        }
+    }
+
+    // Enquanto injeta, o controle fica COBERTO: é o estado "trabalhando".
+    const float radius = CortinaCircle(draw, mn, mx, kRound, s_injectFill,
+        kFillTime, hovered || busy, pressed);
+    const ImVec2 cc(mn.x + (mx.x - mn.x) * 0.5f, mn.y + (mx.y - mn.y) * 0.5f);
+
+    // Progresso da troca: 1 = parado (sem animação pendente)
+    if (s_injectAnim < 1.0f)
+        s_injectAnim = Clamp01(s_injectAnim + ImGui::GetIO().DeltaTime / kSwapTime);
+    const float ap = EaseSmooth(s_injectAnim);
+
+    const float H = mx.y - mn.y;
+    const ImVec2 tMin(mn.x + 10.0f, mn.y);
+    const ImVec2 tMax(mx.x - kIconZone, mx.y);     // texto não invade o símbolo
+
+    // Rótulo com auto-ajuste: usa kSize, mas encolhe o mínimo necessário para
+    // caber na faixa de texto. Os DOIS rótulos usam o mesmo tamanho, o menor
+    // dos dois, para a troca animada não ficar com fontes diferentes.
+    const float availW = tMax.x - tMin.x;
+    const float parkedSize = fminf(FitTextSize(font, kInjectLabels[0], kSize, availW),
+        FitTextSize(font, kInjectLabels[1], kSize, availW));
+    auto drawFitted = [&](const char* txt, float maxSize, float dy) {
+        const float size = FitTextSize(font, txt, maxSize, availW);
+        const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
+        const ImVec2 tp(tMin.x, mn.y + (H - ts.y) * 0.5f + dy);
+        const ImVec2 bMin(tp.x - 1.0f, tp.y - 1.0f);
+        const ImVec2 bMax(tp.x + ts.x + 1.0f, tp.y + ts.y + 1.0f);
+        RevealByCircle(draw, cc, radius, bMin, bMax, [&](ImU32 col) {
+            draw->AddText(font, size, tp, col, txt);
+            });
+        };
+
+    draw->PushClipRect(tMin, tMax, true);
+    if (busy) {
+        // Estado "injetando": mostra o modo escolhido pelo tempo da trava
+        char buf[64];
+        wsprintfA(buf, "%s...", kInjectLabels[s_injectingMode]);
+        drawFitted(buf, kSize, 0.0f);
+    }
+    else {
+        // Troca normal: o que está saindo sobe e some; o novo sobe vindo de baixo.
+        if (s_injectAnim < 1.0f) drawFitted(kInjectLabels[s_injectPrev], parkedSize, -ap * H);
+        drawFitted(kInjectLabels[s_injectMode], parkedSize, (1.0f - ap) * H);
+    }
+    draw->PopClipRect();
+
+    // Símbolo de alternar, à direita.
+    //   - na troca: meia volta (cai no mesmo desenho, por causa da simetria 180°)
+    //   - injetando: gira sem parar, dando o feedback de "trabalhando"
+    const ImVec2 ic(mx.x - 15.5f, mn.y + H * 0.5f);
+    const float rot = busy
+        ? ((kBlockTime - s_injectBusy) / kSpinTime) * 6.2831853f
+        : ap * 3.14159265f;
+    const ImVec2 iMin(ic.x - 7.0f, ic.y - 7.0f), iMax(ic.x + 7.0f, ic.y + 7.0f);
+    RevealByCircle(draw, cc, radius, iMin, iMax, [&](ImU32 col) {
+        DrawSwapIcon(draw, ic, 5.0f, col, rot);
+        });
+}
+
+// ---------------------------------------------------------------------------
+// MENU de progresso do inject (abre no clique de disparo). Mostra um spinner
+// girando e, embaixo, a etapa atual:
+//   0..2s  -> "Downloading Modules..."
+//   2..4s  -> "Injecting..."
+// A duração é a MESMA da trava do botão (kInjectWorkTime = 4s).
+// ---------------------------------------------------------------------------
+void DrawInjectMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
+    if (!s_menuOpen) return;
+
+    s_menuT += ImGui::GetIO().DeltaTime;
+    if (s_menuT >= kInjectWorkTime) {          // terminou: fecha o menu
+        s_menuOpen = false;
+        return;
+    }
+    const float t = s_menuT;
+    const float fade = fminf(1.0f, fminf(t * 8.0f, (kInjectWorkTime - t) * 8.0f));
+
+    // Escurece o painel inteiro para dar foco ao menu
+    draw->AddRectFilled(p, q, IM_COL32(0, 0, 0, (int)(120.0f * fade)), kRounding);
+
+    // Card centralizado
+    const float w = 236.0f, h = 96.0f;
+    const ImVec2 c((p.x + q.x) * 0.5f, (p.y + q.y) * 0.5f);
+    const ImVec2 mn(c.x - w * 0.5f, c.y - h * 0.5f);
+    const ImVec2 mx(c.x + w * 0.5f, c.y + h * 0.5f);
+    const float round = 12.0f;
+    draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, (int)(255.0f * fade)), round);
+    draw->AddRect(mn, mx, IM_COL32(120, 120, 120, (int)(140.0f * fade)), round, 0, 1.0f);
+
+    // Spinner girando
+    DrawSpinner(draw, ImVec2(c.x, mn.y + 34.0f), 13.0f, t * 5.2f,
+        IM_COL32(255, 255, 255, (int)(240.0f * fade)));
+
+    // Etapa embaixo
+    ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
+    const char* txt = (t < kInjectWorkTime * 0.5f) ? "Downloading Modules..." : "Injecting...";
+    const float size = 14.0f;
+    const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
+    draw->AddText(font, size, ImVec2(c.x - ts.x * 0.5f, mn.y + 60.0f),
+        IM_COL32(255, 255, 255, (int)(245.0f * fade)), txt);
+}
+
+// ---------------------------------------------------------------------------
 // Cards: fundo na MESMA cor do botão Unload.
 // ---------------------------------------------------------------------------
 static char s_userName[256] = { 0 };
@@ -552,81 +864,273 @@ void DrawInfoRow(ImDrawList* draw, ImFont* font, float x, float& y,
 }
 
 // ---------------------------------------------------------------------------
-// Header animado yin-yang (fundo branco + onda S alternando lados a cada
-// 1.5s) com o label tendo a cor "varrida" pela divisória. Usado pelos dois
-// cards. Retorna o Y da divisória (logo abaixo do header).
+// HEADER COM FUMAÇA — o fundo do header é PRETO e a FUMAÇA BRANCA passeia por
+// cima, envolvendo-o: névoa larga (volume) + fita ondulada (corpo) + volutas
+// cruzando no sentido oposto (turbulência) + bolhas que sobem + fumaça
+// lambendo as bordas + faíscas à deriva.
+//
+// O ImGui não tem gradiente radial, então cada "baforada" é um retângulo com
+// 4 rampas de alfa nas bordas e o miolo recuado — NUNCA um quadrado opaco.
+//
+// >>> ATENÇÃO (era o bug do "card piscando"): a cor passada para
+//     AddSmokeBlob tem que ter ALFA = 0 (ex.: IM_COL32(234,239,245,0)).
+//     A função descarta o alfa recebido e monta o alfa POR BLOB
+//     (rgb | alfa<<24). Se o RGB chegar com alfa 255, o OR mantém 255 e
+//     cada blob vira um retângulo 100% OPACO — foi isso que deixou os cards
+//     "piscando" cheios de quadrados brancos e criou um "fundo" atrás de
+//     INFOS/FEATURES.
 // ---------------------------------------------------------------------------
+static inline float Hash01(int i) {
+    const float s = sinf((float)i * 12.9898f) * 43758.5453f;
+    return s - floorf(s);                       // 0..1 determinístico
+}
+
+static inline float WrapRange(float x, float lo, float hi) {
+    const float span = hi - lo;
+    float m = fmodf(x - lo, span);
+    if (m < 0.0f) m += span;
+    return lo + m;
+}
+
+// Baforada: miolo (alfa cheio) + 4 rampas (alfa 0 -> cheio).
+// A rampa é proporcional ao raio: blob grande = borda bem macia; blob pequeno
+// = as rampas se encontram no centro (perfil de "tenda", sem miolo duro).
+static void AddSmokeBlob(ImDrawList* draw, ImVec2 c, float r, ImU32 rgb,
+    float alpha) {
+    if (alpha <= 0.004f || r <= 0.5f) return;
+
+    rgb &= 0x00FFFFFFu;                       // RGB puro (ver aviso no topo)
+    const ImU32 aFull = rgb | (((ImU32)(255.0f * alpha)) << 24);
+
+    float fade = fmaxf(1.5f, r * 0.42f);
+    float core = r - fade;
+    if (core < 0.5f) core = 0.5f;   // garante miolo: sem buraco e sem virar "cruz"
+    fade = r - core;                // a rampa se ajusta ao miolo garantido
+
+    if (core > 0.0f)                          // miolo sólido (recuado)
+        draw->AddRectFilled(ImVec2(c.x - core, c.y - core),
+            ImVec2(c.x + core, c.y + core), aFull);
+
+    const float x0 = c.x - r, x1 = c.x + r, y0 = c.y - r, y1 = c.y + r;
+    const float fx0 = x0 + fade, fy0 = y0 + fade;
+    const float fx1 = x1 - fade, fy1 = y1 - fade;
+    draw->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(fx0, y1),
+        rgb, aFull, aFull, rgb);              // rampa ESQUERDA
+    draw->AddRectFilledMultiColor(ImVec2(fx1, y0), ImVec2(x1, y1),
+        aFull, rgb, rgb, aFull);              // rampa DIREITA
+    draw->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, fy0),
+        rgb, rgb, aFull, aFull);              // rampa de CIMA
+    draw->AddRectFilledMultiColor(ImVec2(x0, fy1), ImVec2(x1, y1),
+        aFull, aFull, rgb, rgb);              // rampa de BAIXO
+}
+
+// O ImGui só tem clip RETANGULAR, então a fumaça (que é reta) passaria por
+// cima das curvas de cima do header e deixaria as pontas "quadradas/pontudas".
+// Aqui a gente devolve a curva: cobre o bico (quadrado menos arco) com a cor
+// do fundo do painel, faixa por faixa. Como o próprio header é quase preto,
+// a cobertura pode sobrar 1px pra dentro sem nenhum efeito visual.
+static void MaskTopCorners(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    float rounding, ImU32 bg) {
+    const float R = rounding + 1.0f;                 // 1px de folga: nada escapa
+    for (int i = 0; i <= (int)rounding; ++i) {
+        const float dy = R - ((float)i + 0.5f);
+        const float dx = sqrtf(fmaxf(0.0f, R * R - dy * dy));
+        const float w = R - dx;                      // largura a cobrir nesta linha
+        if (w <= 0.05f) continue;
+        const float y0 = mn.y + (float)i;
+        draw->AddRectFilled(ImVec2(mn.x, y0), ImVec2(mn.x + w, y0 + 1.0f), bg);
+        draw->AddRectFilled(ImVec2(mx.x - w, y0), ImVec2(mx.x, y0 + 1.0f), bg);
+    }
+}
+
+// Parâmetros da fumaça (mexa aqui para calibrar; nada de número solto no meio)
+struct SmokeCfg {
+    float kOmega = 2.4f;      // velocidade da ondulação
+    float kTide = 7.0f;       // segundos entre uma inversão e outra
+
+    int   nebN = 6;           // névoa de fundo
+    float nebR0 = 17.0f, nebR1 = 38.0f, nebA0 = 0.020f, nebA1 = 0.038f;
+
+    float ropeStep = 2.0f;    // corpo (fita ondulada)
+    float ropeLam = 82.0f;    // comprimento de onda (px)
+    float ropeR0 = 3.0f, ropeR1 = 6.5f, ropeA0 = 0.030f, ropeA1 = 0.065f;
+
+    float haloStep = 5.0f, haloR = 11.0f, haloA = 0.013f;   // aura
+
+    float volStep = 2.5f, volLam = 46.0f;                    // volutas
+    float volR0 = 2.0f, volR1 = 4.2f, volA0 = 0.016f, volA1 = 0.048f;
+
+    int   puffN = 6;          // bolhas que sobem
+    float puffR0 = 6.0f, puffR1 = 13.0f, puffA0 = 0.030f, puffA1 = 0.060f;
+
+    float edgeStep = 3.0f, edgeR = 7.0f;                     // bordas
+    float edgeA0 = 0.014f, edgeA1 = 0.048f;
+
+    int   sparkN = 10;        // faíscas (poeira de luz, discreta)
+    float sparkR0 = 1.4f, sparkR1 = 2.6f, sparkA0 = 0.06f, sparkA1 = 0.14f;
+};
+
+// Desenha o header animado do card. O relógio vem só de ImGui::GetTime() e
+// tudo é amostrado em coordenadas ABSOLUTAS de tela, então os dois headers
+// mostram exatamente a MESMA fumaça (uma peça só, mesmo com o vão no meio).
+// Retorna o Y da divisória (logo abaixo do header).
 float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
-    const ImVec2& mn, const ImVec2& mx, const char* label,
-    float gx, float flip, float amp, float side) {
+    const ImVec2& mn, const ImVec2& mx, const char* label) {
     const float padX = 16.0f;
     const float rounding = 14.0f;
-    const float headerH = 28.0f;
-    const ImU32 headBg = IM_COL32(255, 255, 255, 255);
-    draw->AddRectFilled(mn, ImVec2(mx.x, mn.y + headerH), headBg, rounding);
-    draw->AddRectFilled(ImVec2(mn.x, mn.y + headerH - rounding),
-        ImVec2(mx.x, mn.y + headerH), headBg); // cantos de baixo retos
+    const float headerH = 30.0f;
+    const ImVec2 hmax(mx.x, mn.y + headerH);
+    const ImU32 coreCol = IM_COL32(12, 12, 14, 255);   // base OPACA do header
+    const ImU32 smoke = IM_COL32(234, 239, 245, 0);    // fumaça: RGB puro (alfa 0)
+    static const SmokeCfg C;
 
-    // gx = posição GLOBAL da fronteira (sincronizada entre os dois cards)
-    const float bx = gx;
+    // Base PRETA — é ela que a fumaça envolve.
+    draw->AddRectFilled(mn, hmax, coreCol, rounding);
+    draw->AddRectFilled(ImVec2(mn.x, hmax.y - rounding), hmax, coreCol);
 
-    for (int i = 0; i < (int)headerH; ++i) {
-        const float v = ((float)i + 0.5f) / headerH; // 0..1 na altura
-        const float xx = bx + flip * sinf(v * 6.2831853f) * amp;
-        if (side > 0.0f) {
-            // preto à ESQUERDA da fronteira
-            draw->AddRectFilled(ImVec2(mn.x - 8.0f, mn.y + (float)i),
-                ImVec2(xx, mn.y + (float)i + 1.0f),
-                IM_COL32(0, 0, 0, 255));
-        }
-        else {
-            // preto à DIREITA da fronteira
-            draw->AddRectFilled(ImVec2(xx, mn.y + (float)i),
-                ImVec2(mx.x + 8.0f, mn.y + (float)i + 1.0f),
-                IM_COL32(0, 0, 0, 255));
+    const float t = (float)ImGui::GetTime();
+    const float W = mx.x - mn.x;
+    const float cy = mn.y + headerH * 0.5f;
+    const float kTau = 6.2831853f;
+
+    // Relógio GLOBAL: a "maré" integra uma frequência que vai e volta, então
+    // phaseX = deslocamento da serpentina e flow = deriva dos pontos soltos.
+    const float tideW = kTau / C.kTide;
+    const float phaseX = (C.kOmega / tideW) * sinf(tideW * t);
+    const float flow = phaseX / 0.080f;
+    const float k0 = kTau / C.ropeLam;
+
+    auto blob = [&](float x, float y, float r, float a) {
+        AddSmokeBlob(draw, ImVec2(x, y), r, smoke, a);
+        };
+    // Partículas que dão "wrap" nas pontas somem suavemente no recorte
+    // (sem pipocar na borda do card)
+    const float fadeW = 20.0f;
+    auto edgeFade = [&](float x) {
+        const float d = fminf(x - mn.x, mx.x - x);
+        return d >= fadeW ? 1.0f : fmaxf(0.0f, d / fadeW);
+        };
+
+    draw->PushClipRect(mn, hmax, true);
+
+    // 1) NÉVOA — manchas largas e fracas: dão volume
+    for (int i = 0; i < C.nebN; ++i) {
+        const float s1 = Hash01(i * 13 + 1), s2 = Hash01(i * 29 + 5);
+        const float x = WrapRange(mn.x + s1 * W + flow * 0.85f, mn.x, mx.x);
+        const float y = cy + (s2 - 0.5f) * 10.0f;
+        const float r = C.nebR0 + (C.nebR1 - C.nebR0) * Hash01(i * 41 + 9);
+        const float a = C.nebA0 + (C.nebA1 - C.nebA0)
+            * (0.5f + 0.5f * sinf(t * 0.5f + s1 * kTau));
+        blob(x, y, r, a * edgeFade(x));
+    }
+
+    const float amp = 6.2f + 1.6f * sinf(t * 0.61f);   // respiração da fita
+
+    // 2) HALO — aura macia em volta do corpo (tira o ar de "corda")
+    for (float x = mn.x; x <= mx.x; x += C.haloStep) {
+        const float v = x * k0 + phaseX;
+        const float y = cy + amp * sinf(v) + 1.5f * sinf(v * 2.31f + t * 1.15f);
+        const float puff = 0.5f + 0.5f * sinf(v * 0.47f + 1.9f);
+        blob(x, y, C.haloR, C.haloA * (0.6f + 0.6f * puff) * edgeFade(x));
+    }
+
+    // 3) CORPO — passo fino + raio grande = fita contínua (sem "colar de contas")
+    for (float x = mn.x; x <= mx.x; x += C.ropeStep) {
+        const float v = x * k0 + phaseX;
+        const float y = cy + amp * sinf(v) + 1.5f * sinf(v * 2.31f + t * 1.15f);
+        float puff = 0.5f + 0.5f * sinf(v * 0.47f + 1.9f)
+            + 0.25f * sinf(v * 1.13f + 4.2f)
+            + 0.20f * sinf(v * 0.31f + t * 0.9f);
+        puff = fmaxf(0.0f, fminf(1.3f, puff)) / 1.3f;
+        const float r = C.ropeR0 + (C.ropeR1 - C.ropeR0) * puff;
+        const float a = C.ropeA0 + (C.ropeA1 - C.ropeA0) * puff;
+        // Jitter determinístico no eixo X: quebra a periodicidade do passo
+        // (sem isso a fita vira um "pente" de listras verticais).
+        const float jx = (Hash01((int)(x * 3.7f)) - 0.5f) * C.ropeStep * 0.8f;
+        const float jy = (Hash01((int)(x * 1.3f)) - 0.5f) * 2.5f;
+        blob(x + jx, y, r, a * edgeFade(x));
+        blob(x + jx, y + jy, r * 0.8f, a * 0.6f * edgeFade(x));
+    }
+
+    // 4) VOLUTAS — fitas finas cruzando no sentido oposto: turbulência
+    {
+        const float k2 = kTau / C.volLam;
+        for (float x = mn.x; x <= mx.x; x += C.volStep) {
+            const float v = x * k2 - phaseX * 1.6f;
+            const float y = cy + 4.6f * sinf(v + 0.9f)
+                + 1.2f * sinf(v * 2.7f + t * 1.9f);
+            const float dens = 0.5f + 0.5f * sinf(v * 0.71f + 2.4f);
+            const float jv = (Hash01((int)(x * 5.1f)) - 0.5f) * C.volStep * 0.9f;
+            blob(x + jv, y, C.volR0 + (C.volR1 - C.volR0) * dens,
+                (C.volA0 + (C.volA1 - C.volA0) * dens) * edgeFade(x));
         }
     }
 
-    // Label com a cor acompanhando a divisória (2 desenhos com clip)
+    // 5) BOLHAS QUE SOBEM — pistas clássicas de fumaça
+    for (int i = 0; i < C.puffN; ++i) {
+        const float s1 = Hash01(i * 31 + 7), s2 = Hash01(i * 19 + 3);
+        const float cyc = fmodf(t * (0.20f + 0.14f * s2) + s1 * 7.0f, 1.0f);
+        const float x = WrapRange(mn.x + s2 * W + flow * 0.7f, mn.x, mx.x);
+        const float y = (mn.y + headerH - 3.0f) - cyc * (headerH + 6.0f);
+        const float r = C.puffR0 + (C.puffR1 - C.puffR0)
+            * (0.4f + 0.6f * sinf(3.1415927f * cyc));
+        const float a = (C.puffA0 + (C.puffA1 - C.puffA0) * s1)
+            * sinf(3.1415927f * cyc);
+        blob(x, y, r, a * edgeFade(x));      // nasce e morre suave (sem pipoco)
+    }
+
+    // 6) BORDAS — fumaça lambendo em cima e embaixo: o "abraço" no preto
+    for (float x = mn.x; x <= mx.x; x += C.edgeStep) {
+        const float v = x * k0 * 1.35f + phaseX * 1.2f;
+        const float aT = C.edgeA0 + (C.edgeA1 - C.edgeA0)
+            * fmaxf(0.0f, sinf(v * 0.61f + 0.6f));
+        const float aB = C.edgeA0 + (C.edgeA1 - C.edgeA0)
+            * fmaxf(0.0f, sinf(v * 0.61f + 3.3f));
+        const float je = (Hash01((int)(x * 7.9f)) - 0.5f) * C.edgeStep;
+        blob(x + je, mn.y + 3.0f, C.edgeR, aT);
+        blob(x + je, hmax.y - 3.0f, C.edgeR, aB);
+    }
+
+    // 7) FAÍSCAS — partículas claras que derivam
+    for (int i = 0; i < C.sparkN; ++i) {
+        const float s1 = Hash01(i * 17 + 2), s2 = Hash01(i * 23 + 11);
+        const float spd = 6.0f + 12.0f * s2;
+        const float x = WrapRange(mn.x + s1 * W + spd * t + flow * 0.9f,
+            mn.x, mx.x);
+        const float y = cy + sinf(t * (0.7f + 0.8f * s2) + s1 * kTau)
+            * (headerH * 0.30f);
+        const float a = C.sparkA0 + (C.sparkA1 - C.sparkA0)
+            * (0.5f + 0.5f * sinf(t * (1.1f + 1.3f * s1) + s2 * kTau));
+        blob(x, y, C.sparkR0 + (C.sparkR1 - C.sparkR0) * s2,
+            a * edgeFade(x));
+    }
+
+    // RÓTULO — SEM fundo: só o texto, com uma sombra fina para continuar
+    // legível quando a fumaça passa por baixo.
     {
         const ImVec2 ts = textFont->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, label);
         const ImVec2 tpos(mn.x + padX, mn.y + (headerH - ts.y) * 0.5f);
-        const float vT = ((tpos.y + ts.y * 0.5f) - mn.y) / headerH;
-        const float bxT = bx + flip * sinf(vT * 6.2831853f) * amp;
-
-        if (side > 0.0f) {
-            // preto à esquerda: letras brancas até a fronteira, pretas depois
-            draw->PushClipRect(ImVec2(mn.x, mn.y), ImVec2(bxT, mn.y + headerH));
-            draw->AddText(textFont, kLabelSize, tpos,
-                IM_COL32(255, 255, 255, 255), label);
-            draw->PopClipRect();
-            draw->PushClipRect(ImVec2(bxT, mn.y), ImVec2(mx.x, mn.y + headerH));
-            draw->AddText(textFont, kLabelSize, tpos,
-                IM_COL32(0, 0, 0, 255), label);
-            draw->PopClipRect();
-        }
-        else {
-            // preto à direita: letras pretas até a fronteira, brancas depois
-            draw->PushClipRect(ImVec2(mn.x, mn.y), ImVec2(bxT, mn.y + headerH));
-            draw->AddText(textFont, kLabelSize, tpos,
-                IM_COL32(0, 0, 0, 255), label);
-            draw->PopClipRect();
-            draw->PushClipRect(ImVec2(bxT, mn.y), ImVec2(mx.x, mn.y + headerH));
-            draw->AddText(textFont, kLabelSize, tpos,
-                IM_COL32(255, 255, 255, 255), label);
-            draw->PopClipRect();
-        }
+        draw->AddText(textFont, kLabelSize, ImVec2(tpos.x + 1.0f, tpos.y + 1.0f),
+            IM_COL32(0, 0, 0, 170), label);
+        draw->AddText(textFont, kLabelSize, tpos,
+            IM_COL32(255, 255, 255, 255), label);
     }
+
+    draw->PopClipRect();
+
+    // Cantos de cima: devolve a curva do header por cima da fumaça — sem isso
+    // a fumaça (retangular) deixaria as pontas quadradas/pontudas por cima
+    // do raio do header.
+    MaskTopCorners(draw, mn, mx, rounding, IM_COL32(0, 0, 0, 255));
 
     // Divisória: traço cobrindo TODO o eixo X do card
     const float divY = mn.y + headerH;
-    draw->AddLine(ImVec2(mn.x, divY), ImVec2(mx.x, divY), IM_COL32(0, 0, 0, 180), 1.0f);
+    draw->AddLine(ImVec2(mn.x, divY), ImVec2(mx.x, divY), IM_COL32(150, 160, 175, 45), 1.0f);
     return divY;
 }
 
 // Card esquerdo: header "INFOS" + usuário, nome do PC, plano e data/hora.
-void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
-    float gx, float flip, float amp, float side) {
+void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     const float padX = 16.0f;
     const float rounding = 14.0f;
     ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
@@ -634,8 +1138,7 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     // Corpo do card (mesma cor do botão Unload)
     draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), rounding);
 
-    float y = DrawAnimatedHeader(draw, textFont, mn, mx, "INFOS",
-        gx, flip, amp, side) + 12.0f;
+    float y = DrawAnimatedHeader(draw, textFont, mn, mx, "INFOS") + 12.0f;
 
     // Infos (ícone + rótulo + valor)
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_USER, "Usuario", s_userName);
@@ -717,54 +1220,35 @@ void DrawUI(HWND hWnd) {
             IM_COL32(255, 255, 255, 255), title);
     }
 
+    ImVec2 featMin(0.0f, 0.0f), featMax(0.0f, 0.0f); // área do controle Inject (p/ o drag)
+
     // Dois cards na mesma cor do botão Unload
     {
         const float cardW = 275.0f, cardH = 256.0f, gap = 18.0f;
         const float x0 = p.x + (kPanelW - (cardW * 2.0f + gap)) * 0.5f;
         const float y0 = p.y + 48.0f;
 
-        // Varredura GLOBAL: a fronteira nasce na esquerda do header esquerdo,
-        // atravessa o vão e morre na direita do header direito — os dois
-        // headers dançam como uma coisa só.
-        const float t = (float)ImGui::GetTime();
-        const float ph = fmodf(t, 3.0f);
-        const float sw = (ph < 1.5f) ? EaseSmooth(ph / 1.5f)
-            : 1.0f - EaseSmooth((ph - 1.5f) / 1.5f);
-        // Sincronia ESPELHADA: o preto nasce no vão entre os cards e flui
-        // pra fora — pra ESQUERDA do header esquerdo e pra DIREITA do header
-        // direito (e volta). Cada header cuida da sua onda; nunca troca de
-        // cor entre um card e outro.
-        const float M = 12.0f; // margem p/ curva S sair inteira nos extremos
-        const float lx1 = x0 + cardW;                 // direita do card esquerdo
-        const float rx0 = x0 + cardW + gap;           // esquerda do card direito
-        const float rx1 = x0 + cardW * 2.0f + gap;    // direita do card direito
-        const float gxL = (lx1 + M) - sw * ((lx1 + M) - (x0 - M));
-        const float gxR = (rx0 - M) + sw * ((rx1 + M) - (rx0 - M));
+        // Card esquerdo: INFOS (a fumaça é uma só, compartilhada pelos dois)
+        DrawInfosCard(draw, ImVec2(x0, y0), ImVec2(x0 + cardW, y0 + cardH));
 
-        // Virada suave do S nos limites + amplitude "respirando"
-        const float TR = 0.45f;
-        float flip;
-        if (ph < 1.5f - TR * 0.5f)
-            flip = 1.0f;
-        else if (ph < 1.5f + TR * 0.5f)
-            flip = 1.0f - 2.0f * EaseSmooth((ph - (1.5f - TR * 0.5f)) / TR);
-        else if (ph < 3.0f - TR * 0.5f)
-            flip = -1.0f;
-        else
-            flip = -1.0f + 2.0f * EaseSmooth((ph - (3.0f - TR * 0.5f)) / TR);
-        const float amp = 6.0f + 2.0f * sinf(t * 2.0f);
-
-        // Card esquerdo: INFOS (preto flui da direita p/ a esquerda)
-        DrawInfosCard(draw, ImVec2(x0, y0), ImVec2(x0 + cardW, y0 + cardH),
-            gxL, -flip, amp, -1.0f);
-
-        // Card direito: header animado "FEATURES" (preto flui da esquerda p/ a direita)
+        // Card direito: header animado "FEATURES" + botãozinho (20x15)
         {
             const ImVec2 rmn(x0 + cardW + gap, y0);
             const ImVec2 rmx(x0 + cardW * 2.0f + gap, y0 + cardH);
             DrawCardBase(draw, rmn, rmx);
-            DrawAnimatedHeader(draw, g_fontText ? g_fontText : ImGui::GetFont(),
-                rmn, rmx, "FEATURES", gxR, flip, amp, 1.0f);
+            const float divY = DrawAnimatedHeader(draw,
+                g_fontText ? g_fontText : ImGui::GetFont(), rmn, rmx, "FEATURES");
+
+            // Botão de inject (único controle do card), colado na margem
+            // direita (padX = 16) e 10px abaixo de onde o botãozinho estava.
+            const float by = divY + 22.0f;
+            const float bW = 245.0f, bH = 40.0f;   // 230+15 x 50-10
+            // (a largura extra cresce p/ a ESQUERDA: a borda direita fica
+            //  ancorada na margem de 16px do card)
+            const ImVec2 iMn(rmx.x - 16.0f - bW, by);
+            DrawInjectControl(draw, iMn, ImVec2(iMn.x + bW, by + bH),
+                featMin, featMax);
+
             // borda por cima do header, igual ao card esquerdo
             draw->AddRect(rmn, rmx, IM_COL32(85, 85, 85, 80), kRounding, 0, 1.0f);
         }
@@ -774,7 +1258,10 @@ void DrawUI(HWND hWnd) {
     ImVec2 exMin, exMax;
     DrawPowerButton(draw, p, q, exMin, exMax);
 
-    HandleDrag(hWnd, p, q, exMin, exMax);
+    HandleDrag(hWnd, p, q, exMin, exMax, featMin, featMax);
+
+    // Menu de progresso do inject (só aparece quando s_menuOpen)
+    DrawInjectMenu(draw, p, q);
 
     ImGui::End();
 }
