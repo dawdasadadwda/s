@@ -393,6 +393,12 @@ static float s_pillAnim = 0.0f; // 0 = círculo, 1 = pill aberto
 static float Clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 static float EaseSmooth(float x) { return x * x * (3.0f - 2.0f * x); }
 
+// Evita saltos nas animações no primeiro frame (criação do atlas/shaders pode
+// deixar o DeltaTime inicial muito alto em algumas máquinas/drivers).
+static float AnimDeltaTime() {
+    return fminf(ImGui::GetIO().DeltaTime, 1.0f / 30.0f);
+}
+
 // Texto com leve "claridade": halo BEM sutil ao redor + texto nítido por cima.
 // Deslocamento mínimo (0.5px) e alpha baixo para NÃO parecer contorno grosso.
 static void DrawTextGlow(ImDrawList* draw, ImFont* font, float size, const ImVec2& pos,
@@ -434,7 +440,7 @@ void DrawPowerButton(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
         g_running = false; // power fecha o programa
 
     // Animação: só um deslizar para a esquerda, com suavidade (smoothstep)
-    const float dt = ImGui::GetIO().DeltaTime;
+    const float dt = AnimDeltaTime();
     const float target = hovered ? 1.0f : 0.0f;
     if (s_pillAnim < target) {
         s_pillAnim += dt * 4.0f; // expansão mais lenta
@@ -472,7 +478,10 @@ void DrawPowerButton(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
     }
 
     // --- Corpo (plástico escuro). Largura 2r + rounding r = círculo perfeito. ---
-    const ImU32 face = hovered ? IM_COL32(45, 45, 45, 255) : IM_COL32(30, 30, 30, 255);
+    // Mesma cor personalizada usada no header e no Stream Proof.
+    const ImU32 face = hovered
+        ? IM_COL32(18, 19, 23, 255)
+        : IM_COL32(12, 13, 16, 255);
     draw->AddRectFilled(pillMin, pillMax, face, radius);
 
     // --- Borda ---
@@ -523,12 +532,26 @@ void DrawPowerButton(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
 // símbolo invertem de cor conforme o branco passa por baixo.
 // ---------------------------------------------------------------------------
 static int   s_injectMode = 0;      // 0 = "Inject Hide" | 1 = "Inject Normal"
-static int   s_injectPrev = 0;      // rótulo que está saindo
-static float s_injectAnim = 1.0f;   // 0..1 na troca (1 = parado, sem animação)
+static int   s_injectPrev = 0;      // modo anterior durante a animação
+static float s_injectAnim = 1.0f;   // 0..1 (1 = animação concluída)
 static const char* kInjectLabels[2] = { "Inject Hide", "Inject Normal" };
-static float s_injectFill = 0.0f;   // cortina do hover: 0 = vazio | 1 = coberto
+static float s_injectSheen = 0.0f;  // animação do reflexo no hover do botão  // fade do reflexo animado no hover
 static float s_injectBusy = 0.0f;   // segundos restantes de trava (0 = livre)
 static int   s_injectingMode = 0;   // modo que está sendo injetado agora
+
+// Estado independente do botão de limpeza.
+static int   s_cleanMode = 0;       // 0 = Full Traces | 1 = Traces
+static int   s_cleanPrev = 0;
+static float s_cleanAnim = 1.0f;
+static float s_cleanSheen = 0.0f;
+static float s_cleanBusy = 0.0f;
+static int   s_cleaningMode = 0;
+static const char* kCleanLabels[2] = { "Clean Full Traces", "Clean Traces" };
+
+// Checkbox personalizado "Stream Proof" do card Features.
+static bool  s_streamProof = false;
+static float s_streamProofAnim = 0.0f;
+static float s_streamProofHover = 0.0f;
 
 // Menu de progresso (abre no clique de disparo e dura o mesmo tempo da trava)
 static const float kInjectWorkTime = 4.0f;   // duração (s): menu = trava do botão
@@ -623,6 +646,92 @@ static void DrawSwapIcon(ImDrawList* draw, const ImVec2& c, float r, ImU32 col, 
     }
 }
 
+// Preenche somente a interseção entre um círculo e um retângulo arredondado.
+// PushClipRect recorta apenas em formato retangular e era justamente o que
+// deixava as pontas quadradas durante o hover.
+static void AddCircleClippedToRoundedRect(ImDrawList* draw, const ImVec2& center,
+    float circleRadius, const ImVec2& mn, const ImVec2& mx, float rounding, ImU32 col) {
+    if (circleRadius <= 0.0f) return;
+
+    const int y0 = (int)floorf(fmaxf(mn.y, center.y - circleRadius));
+    const int y1 = (int)ceilf(fminf(mx.y, center.y + circleRadius));
+    const float topCY = mn.y + rounding;
+    const float botCY = mx.y - rounding;
+
+    for (int y = y0; y < y1; ++y) {
+        const float py = (float)y + 0.5f;
+        const float cdy = py - center.y;
+        const float circleR2 = circleRadius * circleRadius - cdy * cdy;
+        if (circleR2 <= 0.0f) continue;
+
+        const float circleDX = sqrtf(circleR2);
+        float rx0 = mn.x;
+        float rx1 = mx.x;
+
+        // Limites horizontais do retângulo arredondado nesta linha.
+        if (rounding > 0.0f && py < topCY) {
+            const float dy = topCY - py;
+            const float dx = sqrtf(fmaxf(0.0f, rounding * rounding - dy * dy));
+            rx0 = mn.x + rounding - dx;
+            rx1 = mx.x - rounding + dx;
+        }
+        else if (rounding > 0.0f && py > botCY) {
+            const float dy = py - botCY;
+            const float dx = sqrtf(fmaxf(0.0f, rounding * rounding - dy * dy));
+            rx0 = mn.x + rounding - dx;
+            rx1 = mx.x - rounding + dx;
+        }
+
+        const float x0 = fmaxf(center.x - circleDX, rx0);
+        const float x1 = fminf(center.x + circleDX, rx1);
+        if (x1 > x0)
+            draw->AddRectFilled(ImVec2(x0, (float)y), ImVec2(x1, (float)y + 1.0f), col);
+    }
+}
+
+// Reflexo horizontal igual ao dos headers, mas recortado geometricamente no
+// rounding do botão (sem PushClipRect quadrado nos cantos).
+static void AddRoundedSheen(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    float rounding, float centerX, float halfW, ImU32 rgb, float opacity) {
+    if (opacity <= 0.001f || halfW <= 0.0f) return;
+    rgb &= 0x00FFFFFFu;
+
+    const int y0 = (int)floorf(mn.y);
+    const int y1 = (int)ceilf(mx.y);
+    const float topCY = mn.y + rounding;
+    const float botCY = mx.y - rounding;
+
+    for (int y = y0; y < y1; ++y) {
+        const float py = (float)y + 0.5f;
+        float rx0 = mn.x, rx1 = mx.x;
+        if (py < topCY) {
+            const float dy = topCY - py;
+            const float dx = sqrtf(fmaxf(0.0f, rounding * rounding - dy * dy));
+            rx0 = mn.x + rounding - dx;
+            rx1 = mx.x - rounding + dx;
+        }
+        else if (py > botCY) {
+            const float dy = py - botCY;
+            const float dx = sqrtf(fmaxf(0.0f, rounding * rounding - dy * dy));
+            rx0 = mn.x + rounding - dx;
+            rx1 = mx.x - rounding + dx;
+        }
+
+        const float x0 = fmaxf(rx0, centerX - halfW);
+        const float x1 = fminf(rx1, centerX + halfW);
+        if (x1 <= x0) continue;
+
+        auto alphaAt = [&](float x) {
+            const float k = 1.0f - fabsf(x - centerX) / halfW;
+            return (int)(255.0f * opacity * EaseSmooth(Clamp01(k)));
+            };
+        const ImU32 c0 = rgb | ((ImU32)alphaAt(x0) << 24);
+        const ImU32 c1 = rgb | ((ImU32)alphaAt(x1) << 24);
+        draw->AddRectFilledMultiColor(ImVec2(x0, (float)y), ImVec2(x1, (float)y + 1.0f),
+            c0, c1, c1, c0);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Cortina do hover: círculo branco que nasce no CENTRO do controle e cresce
 // (nos dois eixos) até cobrir o botão inteiro — inclusive os cantos, por isso o
@@ -631,7 +740,7 @@ static void DrawSwapIcon(ImDrawList* draw, const ImVec2& c, float r, ImU32 col, 
 // ---------------------------------------------------------------------------
 static float CortinaCircle(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     float round, float& fill, float fillTime, bool active, bool pressed) {
-    const float dt = ImGui::GetIO().DeltaTime;
+    const float dt = AnimDeltaTime();
     fill = Clamp01(fill + (active ? 1.0f : -1.0f) * dt / fillTime);
     const float t = EaseSmooth(fill);
 
@@ -652,14 +761,10 @@ static float CortinaCircle(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     const float radius = halfDiag * t;     // NASCE no centro e abre nos 2 eixos
 
     if (radius > 0.5f) {
-        // O círculo é recortado pelo retângulo do controle: os cantos redondos
-        // continuam certos e o branco não vaza pra fora do botão.
-        draw->PushClipRect(mn, mx, true);
-        draw->AddCircleFilled(ImVec2(cxm, cym), radius,
-            pressed ? IM_COL32(235, 235, 235, 255) : IM_COL32(255, 255, 255, 255), 64);
-        if (t < 0.985f)                    // anel de luz na borda que avança
-            draw->AddCircle(ImVec2(cxm, cym), radius, IM_COL32(255, 255, 255, 130), 64, 1.5f);
-        draw->PopClipRect();
+        // Recorte geométrico real no mesmo raio do botão. Um PushClipRect aqui
+        // produziria pontas quadradas, pois o clip do ImGui não tem rounding.
+        AddCircleClippedToRoundedRect(draw, ImVec2(cxm, cym), radius, mn, mx, round,
+            pressed ? IM_COL32(235, 235, 235, 255) : IM_COL32(255, 255, 255, 255));
     }
 
     draw->AddRect(mn, mx, IM_COL32(255, 255, 255, (int)(70 + 175 * t)), round, 0, 1.0f);
@@ -669,10 +774,9 @@ static float CortinaCircle(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
 void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     ImVec2& outMin, ImVec2& outMax) {
     const float kRound = 6.0f;         // canto redondo
-    const float kFillTime = 0.22f;     // tempo do círculo cobrir tudo (s)
     const float kSize = 17.0f;         // rótulo (o auto-fit reduz se não couber)
     const float kIconZone = 20.0f;     // faixa reservada p/ o símbolo (à direita)
-    const float kSwapTime = 0.26f;     // duração da troca de rótulo (s)
+    const float kSwapTime = 0.26f;     // duração da troca animada
     const float kBlockTime = kInjectWorkTime;   // trava depois de disparar (s)
     const float kSpinTime = 1.8f;      // volta completa do símbolo enquanto injeta (s)
 
@@ -683,7 +787,7 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
 
     // Trava em andamento? (desconta o tempo; 0 = livre)
     if (s_injectBusy > 0.0f)
-        s_injectBusy = fmaxf(0.0f, s_injectBusy - ImGui::GetIO().DeltaTime);
+        s_injectBusy = fmaxf(0.0f, s_injectBusy - AnimDeltaTime());
     const bool busy = s_injectBusy > 0.0f;
 
     ImGui::SetCursorScreenPos(mn);
@@ -699,6 +803,7 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     if (ImGui::IsItemClicked() && !busy) {
         if (overIcon) {
             // --- símbolo: ALTERNA a seleção (Hide <-> Normal) ---
+            // Reinicia a animação de troca sem usar máscaras/scissors por pixel.
             s_injectPrev = s_injectMode;
             s_injectMode = 1 - s_injectMode;
             s_injectAnim = 0.0f;
@@ -714,14 +819,56 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         }
     }
 
-    // Enquanto injeta, o controle fica COBERTO: é o estado "trabalhando".
-    const float radius = CortinaCircle(draw, mn, mx, kRound, s_injectFill,
-        kFillTime, hovered || busy, pressed);
+    // Hover do BOTÃO INTEIRO: usa a mesma faixa de luz animada dos headers.
+    // A antiga cortina circular foi removida porque escondia o reflexo e dava
+    // a impressão de que somente o label estava sendo animado.
+    const float radius = 0.0f; // conteúdo permanece branco sobre o fundo escuro
+
+    const float sheenTarget = hovered ? 1.0f : 0.0f;
+    const float sheenStep = AnimDeltaTime() * 8.0f;
+    if (s_injectSheen < sheenTarget)
+        s_injectSheen = fminf(sheenTarget, s_injectSheen + sheenStep);
+    else if (s_injectSheen > sheenTarget)
+        s_injectSheen = fmaxf(sheenTarget, s_injectSheen - sheenStep);
+
+    // Halo externo e corpo respondem ao hover em conjunto.
+    if (s_injectSheen > 0.001f) {
+        for (int i = 3; i >= 1; --i) {
+            const float g = (float)i * 1.5f;
+            draw->AddRectFilled(ImVec2(mn.x - g, mn.y - g),
+                ImVec2(mx.x + g, mx.y + g),
+                IM_COL32(255, 255, 255,
+                    (int)(22.0f * EaseSmooth(s_injectSheen) / (float)i)),
+                kRound + g);
+        }
+    }
+
+    const ImU32 face = pressed ? IM_COL32(24, 25, 29, 255)
+        : (hovered ? IM_COL32(19, 20, 24, 255) : IM_COL32(30, 30, 30, 255));
+    draw->AddRectFilled(mn, mx, face, kRound);
+
+    // O reflexo só nasce quando o mouse realmente está sobre o controle e
+    // atravessa toda a superfície, não apenas a área do texto.
+    if (s_injectSheen > 0.001f) {
+        const float W = mx.x - mn.x;
+        const float cycle = W + 150.0f;
+        const float sheenX = mn.x - 75.0f +
+            fmodf((float)ImGui::GetTime() * 105.0f, cycle);
+        AddRoundedSheen(draw, ImVec2(mn.x + 1.0f, mn.y + 1.0f),
+            ImVec2(mx.x - 1.0f, mx.y - 1.0f), kRound - 1.0f,
+            sheenX, 62.0f, IM_COL32(255, 255, 255, 0),
+            0.28f * EaseSmooth(s_injectSheen));
+    }
+
+    draw->AddRect(mn, mx,
+        IM_COL32(255, 255, 255,
+            (int)(70.0f + 105.0f * EaseSmooth(s_injectSheen))),
+        kRound, 0, 1.0f);
+
     const ImVec2 cc(mn.x + (mx.x - mn.x) * 0.5f, mn.y + (mx.y - mn.y) * 0.5f);
 
-    // Progresso da troca: 1 = parado (sem animação pendente)
     if (s_injectAnim < 1.0f)
-        s_injectAnim = Clamp01(s_injectAnim + ImGui::GetIO().DeltaTime / kSwapTime);
+        s_injectAnim = Clamp01(s_injectAnim + AnimDeltaTime() / kSwapTime);
     const float ap = EaseSmooth(s_injectAnim);
 
     const float H = mx.y - mn.y;
@@ -734,15 +881,21 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     const float availW = tMax.x - tMin.x;
     const float parkedSize = fminf(FitTextSize(font, kInjectLabels[0], kSize, availW),
         FitTextSize(font, kInjectLabels[1], kSize, availW));
-    auto drawFitted = [&](const char* txt, float maxSize, float dy) {
+    auto drawFitted = [&](const char* txt, float maxSize, float dy, float alpha) {
         const float size = FitTextSize(font, txt, maxSize, availW);
         const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
         const ImVec2 tp(tMin.x, mn.y + (H - ts.y) * 0.5f + dy);
-        const ImVec2 bMin(tp.x - 1.0f, tp.y - 1.0f);
-        const ImVec2 bMax(tp.x + ts.x + 1.0f, tp.y + ts.y + 1.0f);
-        RevealByCircle(draw, cc, radius, bMin, bMax, [&](ImU32 col) {
-            draw->AddText(font, size, tp, col, txt);
-            });
+
+        // Uma única emissão de texto por frame. Evita dezenas de cópias do
+        // mesmo glifo com scissors de 1 px, que causavam corrupção do draw list
+        // em combinações mais antigas de ImGui + DX11.
+        const ImVec2 tc(tp.x + ts.x * 0.5f, tp.y + ts.y * 0.5f);
+        const float textDist = sqrtf((tc.x - cc.x) * (tc.x - cc.x) +
+            (tc.y - cc.y) * (tc.y - cc.y));
+        const float textMix = EaseSmooth(Clamp01((radius - textDist + 6.0f) / 12.0f));
+        const int shade = (int)(255.0f + (12.0f - 255.0f) * textMix);
+        draw->AddText(font, size, tp,
+            IM_COL32(shade, shade, shade, (int)(255.0f * Clamp01(alpha))), txt);
         };
 
     draw->PushClipRect(tMin, tMax, true);
@@ -750,12 +903,17 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         // Estado "injetando": mostra o modo escolhido pelo tempo da trava
         char buf[64];
         wsprintfA(buf, "%s...", kInjectLabels[s_injectingMode]);
-        drawFitted(buf, kSize, 0.0f);
+        drawFitted(buf, kSize, 0.0f, 1.0f);
+    }
+    else if (s_injectAnim < 1.0f) {
+        // Slide vertical no eixo Y: o label anterior sai completamente por
+        // cima e o novo entra completamente por baixo. O clip da faixa de
+        // texto mantém os dois dentro do botão durante a transição.
+        drawFitted(kInjectLabels[s_injectPrev], parkedSize, -ap * H, 1.0f);
+        drawFitted(kInjectLabels[s_injectMode], parkedSize, (1.0f - ap) * H, 1.0f);
     }
     else {
-        // Troca normal: o que está saindo sobe e some; o novo sobe vindo de baixo.
-        if (s_injectAnim < 1.0f) drawFitted(kInjectLabels[s_injectPrev], parkedSize, -ap * H);
-        drawFitted(kInjectLabels[s_injectMode], parkedSize, (1.0f - ap) * H);
+        drawFitted(kInjectLabels[s_injectMode], parkedSize, 0.0f, 1.0f);
     }
     draw->PopClipRect();
 
@@ -765,11 +923,254 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     const ImVec2 ic(mx.x - 15.5f, mn.y + H * 0.5f);
     const float rot = busy
         ? ((kBlockTime - s_injectBusy) / kSpinTime) * 6.2831853f
+        : ap * 3.14159265f; // meia volta suave durante a alternância
+    // Desenha o símbolo UMA única vez. A versão anterior o redesenhava em até
+    // 14 clips horizontais para simular a interseção com o círculo; em alguns
+    // backends/GPUs isso estourava o lote de geometria justamente no primeiro
+    // hover sobre o ícone e corrompia o restante do frame.
+    const float iconDist = sqrtf((ic.x - cc.x) * (ic.x - cc.x) +
+        (ic.y - cc.y) * (ic.y - cc.y));
+    const float iconMix = EaseSmooth(Clamp01((radius - iconDist + 4.0f) / 8.0f));
+    const int iconShade = (int)(255.0f + (12.0f - 255.0f) * iconMix);
+    DrawSwapIcon(draw, ic, 5.0f,
+        IM_COL32(iconShade, iconShade, iconShade, 255), rot);
+}
+
+// ---------------------------------------------------------------------------
+// Botão CLEAN — visual idêntico ao Inject, mas com estado e ID independentes.
+// O ícone alterna entre "Clean Full Traces" e "Clean Traces"; o restante do
+// botão dispara a ação selecionada e mostra um estado curto de processamento.
+// ---------------------------------------------------------------------------
+void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    ImVec2& outMin, ImVec2& outMax) {
+    const float kRound = 6.0f;
+    const float kSize = 17.0f;
+    const float kIconZone = 20.0f;
+    const float kSwapTime = 0.26f;
+    const float kWorkTime = 2.5f;
+
+    outMin = mn;
+    outMax = mx;
+    ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
+
+    if (s_cleanBusy > 0.0f)
+        s_cleanBusy = fmaxf(0.0f, s_cleanBusy - AnimDeltaTime());
+    const bool busy = s_cleanBusy > 0.0f;
+
+    ImGui::SetCursorScreenPos(mn);
+    ImGui::InvisibleButton("##clean_traces", ImVec2(mx.x - mn.x, mx.y - mn.y));
+    const bool hovered = ImGui::IsItemHovered() && !s_dragging;
+    const bool pressed = hovered && !busy && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    const bool overIcon = ImGui::GetIO().MousePos.x >= (mx.x - kIconZone);
+
+    if (ImGui::IsItemClicked() && !busy) {
+        if (overIcon) {
+            s_cleanPrev = s_cleanMode;
+            s_cleanMode = 1 - s_cleanMode;
+            s_cleanAnim = 0.0f;
+        }
+        else {
+            s_cleaningMode = s_cleanMode;
+            s_cleanBusy = kWorkTime;
+            // TODO: execute a limpeza real aqui usando s_cleaningMode.
+        }
+    }
+
+    if (s_cleanAnim < 1.0f)
+        s_cleanAnim = Clamp01(s_cleanAnim + AnimDeltaTime() / kSwapTime);
+    const float ap = EaseSmooth(s_cleanAnim);
+
+    const float sheenTarget = hovered ? 1.0f : 0.0f;
+    const float sheenStep = AnimDeltaTime() * 8.0f;
+    if (s_cleanSheen < sheenTarget)
+        s_cleanSheen = fminf(sheenTarget, s_cleanSheen + sheenStep);
+    else if (s_cleanSheen > sheenTarget)
+        s_cleanSheen = fmaxf(sheenTarget, s_cleanSheen - sheenStep);
+
+    if (s_cleanSheen > 0.001f) {
+        for (int i = 3; i >= 1; --i) {
+            const float g = (float)i * 1.5f;
+            draw->AddRectFilled(ImVec2(mn.x - g, mn.y - g),
+                ImVec2(mx.x + g, mx.y + g),
+                IM_COL32(255, 255, 255,
+                    (int)(22.0f * EaseSmooth(s_cleanSheen) / (float)i)),
+                kRound + g);
+        }
+    }
+
+    const ImU32 face = pressed ? IM_COL32(24, 25, 29, 255)
+        : (hovered ? IM_COL32(19, 20, 24, 255) : IM_COL32(30, 30, 30, 255));
+    draw->AddRectFilled(mn, mx, face, kRound);
+
+    if (s_cleanSheen > 0.001f) {
+        const float W = mx.x - mn.x;
+        const float cycle = W + 150.0f;
+        const float sheenX = mn.x - 75.0f +
+            fmodf((float)ImGui::GetTime() * 105.0f + 80.0f, cycle);
+        AddRoundedSheen(draw, ImVec2(mn.x + 1.0f, mn.y + 1.0f),
+            ImVec2(mx.x - 1.0f, mx.y - 1.0f), kRound - 1.0f,
+            sheenX, 62.0f, IM_COL32(255, 255, 255, 0),
+            0.28f * EaseSmooth(s_cleanSheen));
+    }
+
+    draw->AddRect(mn, mx,
+        IM_COL32(255, 255, 255,
+            (int)(70.0f + 105.0f * EaseSmooth(s_cleanSheen))),
+        kRound, 0, 1.0f);
+
+    const float H = mx.y - mn.y;
+    const ImVec2 tMin(mn.x + 10.0f, mn.y);
+    const ImVec2 tMax(mx.x - kIconZone, mx.y);
+    const float availW = tMax.x - tMin.x;
+    const float parkedSize = fminf(FitTextSize(font, kCleanLabels[0], kSize, availW),
+        FitTextSize(font, kCleanLabels[1], kSize, availW));
+
+    auto drawLabel = [&](const char* txt, float maxSize, float dy) {
+        const float size = FitTextSize(font, txt, maxSize, availW);
+        const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
+        const ImVec2 tp(tMin.x, mn.y + (H - ts.y) * 0.5f + dy);
+        draw->AddText(font, size, tp, IM_COL32(255, 255, 255, 255), txt);
+        };
+
+    draw->PushClipRect(tMin, tMax, true);
+    if (busy) {
+        char buf[64];
+        wsprintfA(buf, "%s...", kCleanLabels[s_cleaningMode]);
+        drawLabel(buf, kSize, 0.0f);
+    }
+    else if (s_cleanAnim < 1.0f) {
+        drawLabel(kCleanLabels[s_cleanPrev], parkedSize, -ap * H);
+        drawLabel(kCleanLabels[s_cleanMode], parkedSize, (1.0f - ap) * H);
+    }
+    else {
+        drawLabel(kCleanLabels[s_cleanMode], parkedSize, 0.0f);
+    }
+    draw->PopClipRect();
+
+    const ImVec2 ic(mx.x - 15.5f, mn.y + H * 0.5f);
+    const float rot = busy
+        ? ((kWorkTime - s_cleanBusy) / 1.8f) * 6.2831853f
         : ap * 3.14159265f;
-    const ImVec2 iMin(ic.x - 7.0f, ic.y - 7.0f), iMax(ic.x + 7.0f, ic.y + 7.0f);
-    RevealByCircle(draw, cc, radius, iMin, iMax, [&](ImU32 col) {
-        DrawSwapIcon(draw, ic, 5.0f, col, rot);
-        });
+    DrawSwapIcon(draw, ic, 5.0f, IM_COL32(255, 255, 255, 255), rot);
+}
+
+// ---------------------------------------------------------------------------
+// Checkbox vetorial "Stream Proof": paleta do header, reflexo no hover e
+// check desenhado progressivamente. Todo o controle é clicável.
+// ---------------------------------------------------------------------------
+void DrawStreamProofCheckbox(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    ImVec2& outMin, ImVec2& outMax) {
+    outMin = mn;
+    outMax = mx;
+
+    const float dt = AnimDeltaTime();
+    ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
+
+    ImGui::SetCursorScreenPos(mn);
+    ImGui::InvisibleButton("##stream_proof", ImVec2(mx.x - mn.x, mx.y - mn.y));
+    const bool hovered = ImGui::IsItemHovered() && !s_dragging;
+    const bool held = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (ImGui::IsItemClicked())
+        s_streamProof = !s_streamProof;
+
+    const float hoverTarget = hovered ? 1.0f : 0.0f;
+    const float checkTarget = s_streamProof ? 1.0f : 0.0f;
+    const float hoverStep = dt * 8.0f;
+    const float checkStep = dt * 6.5f;
+    if (s_streamProofHover < hoverTarget)
+        s_streamProofHover = fminf(hoverTarget, s_streamProofHover + hoverStep);
+    else
+        s_streamProofHover = fmaxf(hoverTarget, s_streamProofHover - hoverStep);
+    if (s_streamProofAnim < checkTarget)
+        s_streamProofAnim = fminf(checkTarget, s_streamProofAnim + checkStep);
+    else
+        s_streamProofAnim = fmaxf(checkTarget, s_streamProofAnim - checkStep);
+
+    const float ht = EaseSmooth(s_streamProofHover);
+    const float ct = EaseSmooth(s_streamProofAnim);
+
+    // Sem background atrás do label: toda a identidade visual fica contida
+    // exclusivamente na caixa do checkbox.
+    const float boxSize = 18.0f + ct * 1.5f;
+    const ImVec2 bc(mn.x + 15.0f, (mn.y + mx.y) * 0.5f);
+    const ImVec2 b0(bc.x - boxSize * 0.5f, bc.y - boxSize * 0.5f);
+    const ImVec2 b1(bc.x + boxSize * 0.5f, bc.y + boxSize * 0.5f);
+
+    // Halo localizado somente ao redor da caixa.
+    const float glow = fmaxf(ht * 0.65f, ct);
+    if (glow > 0.001f)
+        draw->AddRectFilled(ImVec2(b0.x - 3.0f * glow, b0.y - 3.0f * glow),
+            ImVec2(b1.x + 3.0f * glow, b1.y + 3.0f * glow),
+            IM_COL32(255, 255, 255, (int)(25.0f * glow)), 7.0f);
+
+    // Cor personalizada do header aplicada dentro do checkbox.
+    const ImU32 boxBg = held ? IM_COL32(8, 9, 12, 255)
+        : IM_COL32(12, 13, 16, 255);
+    draw->AddRectFilled(b0, b1, boxBg, 4.5f);
+    draw->AddRectFilledMultiColor(
+        ImVec2(b0.x + 4.0f, b0.y), ImVec2(b1.x - 4.0f, b1.y),
+        IM_COL32(255, 255, 255, (int)(10.0f + 8.0f * ht)),
+        IM_COL32(255, 255, 255, 2),
+        IM_COL32(255, 255, 255, 0),
+        IM_COL32(255, 255, 255, 6));
+
+    // O reflexo animado também fica limitado ao interior da caixa.
+    if (ht > 0.001f) {
+        const float cycle = boxSize + 28.0f;
+        const float sheenX = b0.x - 14.0f +
+            fmodf((float)ImGui::GetTime() * 48.0f, cycle);
+        AddRoundedSheen(draw, ImVec2(b0.x + 1.0f, b0.y + 1.0f),
+            ImVec2(b1.x - 1.0f, b1.y - 1.0f), 3.5f,
+            sheenX, 8.0f, IM_COL32(255, 255, 255, 0), 0.30f * ht);
+    }
+
+    draw->AddRect(b0, b1,
+        IM_COL32(220, 225, 235,
+            (int)(110.0f + 90.0f * ht + 55.0f * ct)),
+        4.5f, 0, 1.0f);
+
+    // Check em dois segmentos, com pontas e junção arredondadas. O traço final
+    // é redesenhado como uma polyline única para o V nunca parecer quebrado.
+    if (ct > 0.001f) {
+        const ImVec2 a(bc.x - 6.0f, bc.y - 0.3f);
+        const ImVec2 b(bc.x - 1.5f, bc.y + 4.2f);
+        const ImVec2 c(bc.x + 7.0f, bc.y - 5.2f);
+        const ImU32 checkCol = IM_COL32(242, 244, 248, (int)(255.0f * ct));
+        const float thick = 2.35f;
+        const float capR = thick * 0.5f;
+        const float first = Clamp01(ct / 0.40f);
+        const ImVec2 ab(a.x + (b.x - a.x) * first, a.y + (b.y - a.y) * first);
+
+        draw->AddLine(a, ab, checkCol, thick);
+        draw->AddCircleFilled(a, capR, checkCol, 12);
+        draw->AddCircleFilled(ab, capR, checkCol, 12);
+
+        if (ct > 0.40f) {
+            const float second = EaseSmooth(Clamp01((ct - 0.40f) / 0.60f));
+            const ImVec2 bc2(b.x + (c.x - b.x) * second, b.y + (c.y - b.y) * second);
+            draw->AddLine(b, bc2, checkCol, thick);
+            draw->AddCircleFilled(b, capR, checkCol, 12);
+            draw->AddCircleFilled(bc2, capR, checkCol, 12);
+        }
+
+        // Garante uma junção contínua e limpa quando a animação termina.
+        if (ct > 0.985f) {
+            const ImVec2 pts[3] = { a, b, c };
+            draw->AddPolyline(pts, 3, checkCol, 0, thick);
+            draw->AddCircleFilled(a, capR, checkCol, 12);
+            draw->AddCircleFilled(b, capR, checkCol, 12);
+            draw->AddCircleFilled(c, capR, checkCol, 12);
+        }
+    }
+
+    const char* label = "Stream Proof";
+    const float textSize = 14.0f;
+    const ImVec2 ts = font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, label);
+    const ImVec2 tp(mn.x + 31.0f + ht, mn.y + ((mx.y - mn.y) - ts.y) * 0.5f);
+    draw->AddText(font, textSize, ImVec2(tp.x, tp.y + 1.0f),
+        IM_COL32(0, 0, 0, 160), label);
+    draw->AddText(font, textSize, tp,
+        IM_COL32(242, 244, 248, (int)(220.0f + 35.0f * ht)), label);
 }
 
 // ---------------------------------------------------------------------------
@@ -782,7 +1183,7 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
 void DrawInjectMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
     if (!s_menuOpen) return;
 
-    s_menuT += ImGui::GetIO().DeltaTime;
+    s_menuT += AnimDeltaTime();
     if (s_menuT >= kInjectWorkTime) {          // terminou: fecha o menu
         s_menuOpen = false;
         return;
@@ -948,25 +1349,28 @@ struct SmokeCfg {
     float kOmega = 2.4f;      // velocidade da ondulação
     float kTide = 7.0f;       // segundos entre uma inversão e outra
 
-    int   nebN = 6;           // névoa de fundo
+    int   nebN = 4;           // névoa de fundo
     float nebR0 = 17.0f, nebR1 = 38.0f, nebA0 = 0.020f, nebA1 = 0.038f;
 
-    float ropeStep = 2.0f;    // corpo (fita ondulada)
+    // Passos maiores mantêm o visual, mas reduzem bastante os vértices. O lote
+    // anterior chegava perto do limite de índices de backends ImGui/DX11 mais
+    // antigos; ao clicar e adicionar a animação, as cores podiam corromper.
+    float ropeStep = 4.0f;    // corpo (fita ondulada)
     float ropeLam = 82.0f;    // comprimento de onda (px)
-    float ropeR0 = 3.0f, ropeR1 = 6.5f, ropeA0 = 0.030f, ropeA1 = 0.065f;
+    float ropeR0 = 3.5f, ropeR1 = 7.0f, ropeA0 = 0.030f, ropeA1 = 0.065f;
 
-    float haloStep = 5.0f, haloR = 11.0f, haloA = 0.013f;   // aura
+    float haloStep = 8.0f, haloR = 11.0f, haloA = 0.013f;   // aura
 
-    float volStep = 2.5f, volLam = 46.0f;                    // volutas
-    float volR0 = 2.0f, volR1 = 4.2f, volA0 = 0.016f, volA1 = 0.048f;
+    float volStep = 5.0f, volLam = 46.0f;                    // volutas
+    float volR0 = 2.5f, volR1 = 4.8f, volA0 = 0.016f, volA1 = 0.048f;
 
-    int   puffN = 6;          // bolhas que sobem
+    int   puffN = 4;          // bolhas que sobem
     float puffR0 = 6.0f, puffR1 = 13.0f, puffA0 = 0.030f, puffA1 = 0.060f;
 
-    float edgeStep = 3.0f, edgeR = 7.0f;                     // bordas
+    float edgeStep = 6.0f, edgeR = 7.5f;                     // bordas
     float edgeA0 = 0.014f, edgeA1 = 0.048f;
 
-    int   sparkN = 10;        // faíscas (poeira de luz, discreta)
+    int   sparkN = 7;        // faíscas (poeira de luz, discreta)
     float sparkR0 = 1.4f, sparkR1 = 2.6f, sparkA0 = 0.06f, sparkA1 = 0.14f;
 };
 
@@ -976,156 +1380,70 @@ struct SmokeCfg {
 // Retorna o Y da divisória (logo abaixo do header).
 float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
     const ImVec2& mn, const ImVec2& mx, const char* label) {
-    const float padX = 16.0f;
     const float rounding = 14.0f;
-    const float headerH = 30.0f;
+    const float headerH = 34.0f;
     const ImVec2 hmax(mx.x, mn.y + headerH);
-    const ImU32 coreCol = IM_COL32(12, 12, 14, 255);   // base OPACA do header
-    const ImU32 smoke = IM_COL32(234, 239, 245, 0);    // fumaça: RGB puro (alfa 0)
-    static const SmokeCfg C;
-
-    // Base PRETA — é ela que a fumaça envolve.
-    draw->AddRectFilled(mn, hmax, coreCol, rounding);
-    draw->AddRectFilled(ImVec2(mn.x, hmax.y - rounding), hmax, coreCol);
-
     const float t = (float)ImGui::GetTime();
-    const float W = mx.x - mn.x;
-    const float cy = mn.y + headerH * 0.5f;
-    const float kTau = 6.2831853f;
 
-    // Relógio GLOBAL: a "maré" integra uma frequência que vai e volta, então
-    // phaseX = deslocamento da serpentina e flow = deriva dos pontos soltos.
-    const float tideW = kTau / C.kTide;
-    const float phaseX = (C.kOmega / tideW) * sinf(tideW * t);
-    const float flow = phaseX / 0.080f;
-    const float k0 = kTau / C.ropeLam;
-
-    auto blob = [&](float x, float y, float r, float a) {
-        AddSmokeBlob(draw, ImVec2(x, y), r, smoke, a);
-        };
-    // Partículas que dão "wrap" nas pontas somem suavemente no recorte
-    // (sem pipocar na borda do card)
-    const float fadeW = 20.0f;
-    auto edgeFade = [&](float x) {
-        const float d = fminf(x - mn.x, mx.x - x);
-        return d >= fadeW ? 1.0f : fmaxf(0.0f, d / fadeW);
-        };
+    // Base limpa, levemente mais escura que o corpo do card.
+    draw->AddRectFilled(mn, hmax, IM_COL32(12, 13, 16, 255), rounding);
+    draw->AddRectFilled(ImVec2(mn.x, hmax.y - rounding), hmax,
+        IM_COL32(12, 13, 16, 255));
 
     draw->PushClipRect(mn, hmax, true);
 
-    // 1) NÉVOA — manchas largas e fracas: dão volume
-    for (int i = 0; i < C.nebN; ++i) {
-        const float s1 = Hash01(i * 13 + 1), s2 = Hash01(i * 29 + 5);
-        const float x = WrapRange(mn.x + s1 * W + flow * 0.85f, mn.x, mx.x);
-        const float y = cy + (s2 - 0.5f) * 10.0f;
-        const float r = C.nebR0 + (C.nebR1 - C.nebR0) * Hash01(i * 41 + 9);
-        const float a = C.nebA0 + (C.nebA1 - C.nebA0)
-            * (0.5f + 0.5f * sinf(t * 0.5f + s1 * kTau));
-        blob(x, y, r, a * edgeFade(x));
-    }
+    // Gradiente horizontal discreto: dá profundidade sem poluir o header.
+    draw->AddRectFilledMultiColor(mn, hmax,
+        IM_COL32(255, 255, 255, 9), IM_COL32(255, 255, 255, 2),
+        IM_COL32(255, 255, 255, 1), IM_COL32(255, 255, 255, 6));
 
-    const float amp = 6.2f + 1.6f * sinf(t * 0.61f);   // respiração da fita
+    // Reflexo largo e suave atravessando lentamente o card. São somente três
+    // retângulos com gradiente, evitando a geometria excessiva da fumaça antiga.
+    const float W = mx.x - mn.x;
+    const float cycle = W + 150.0f;
+    const float sheenX = mn.x - 75.0f + fmodf(t * 27.0f + mn.x * 0.17f, cycle);
+    draw->AddRectFilledMultiColor(
+        ImVec2(sheenX - 55.0f, mn.y), ImVec2(sheenX, hmax.y),
+        IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 18),
+        IM_COL32(255, 255, 255, 18), IM_COL32(255, 255, 255, 0));
+    draw->AddRectFilledMultiColor(
+        ImVec2(sheenX, mn.y), ImVec2(sheenX + 55.0f, hmax.y),
+        IM_COL32(255, 255, 255, 18), IM_COL32(255, 255, 255, 0),
+        IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 18));
 
-    // 2) HALO — aura macia em volta do corpo (tira o ar de "corda")
-    for (float x = mn.x; x <= mx.x; x += C.haloStep) {
-        const float v = x * k0 + phaseX;
-        const float y = cy + amp * sinf(v) + 1.5f * sinf(v * 2.31f + t * 1.15f);
-        const float puff = 0.5f + 0.5f * sinf(v * 0.47f + 1.9f);
-        blob(x, y, C.haloR, C.haloA * (0.6f + 0.6f * puff) * edgeFade(x));
-    }
+    // Marcador lateral em formato de cápsula, com um halo bem sutil.
+    const ImVec2 markMin(mn.x + 14.0f, mn.y + 10.0f);
+    const ImVec2 markMax(markMin.x + 3.0f, mn.y + 24.0f);
+    draw->AddRectFilled(ImVec2(markMin.x - 2.0f, markMin.y - 2.0f),
+        ImVec2(markMax.x + 2.0f, markMax.y + 2.0f),
+        IM_COL32(255, 255, 255, 18), 4.0f);
+    draw->AddRectFilled(markMin, markMax, IM_COL32(235, 238, 245, 235), 2.0f);
 
-    // 3) CORPO — passo fino + raio grande = fita contínua (sem "colar de contas")
-    for (float x = mn.x; x <= mx.x; x += C.ropeStep) {
-        const float v = x * k0 + phaseX;
-        const float y = cy + amp * sinf(v) + 1.5f * sinf(v * 2.31f + t * 1.15f);
-        float puff = 0.5f + 0.5f * sinf(v * 0.47f + 1.9f)
-            + 0.25f * sinf(v * 1.13f + 4.2f)
-            + 0.20f * sinf(v * 0.31f + t * 0.9f);
-        puff = fmaxf(0.0f, fminf(1.3f, puff)) / 1.3f;
-        const float r = C.ropeR0 + (C.ropeR1 - C.ropeR0) * puff;
-        const float a = C.ropeA0 + (C.ropeA1 - C.ropeA0) * puff;
-        // Jitter determinístico no eixo X: quebra a periodicidade do passo
-        // (sem isso a fita vira um "pente" de listras verticais).
-        const float jx = (Hash01((int)(x * 3.7f)) - 0.5f) * C.ropeStep * 0.8f;
-        const float jy = (Hash01((int)(x * 1.3f)) - 0.5f) * 2.5f;
-        blob(x + jx, y, r, a * edgeFade(x));
-        blob(x + jx, y + jy, r * 0.8f, a * 0.6f * edgeFade(x));
-    }
+    // Título com espaçamento visual e sombra curta.
+    const float textSize = 13.0f;
+    const ImVec2 ts = textFont->CalcTextSizeA(textSize, FLT_MAX, 0.0f, label);
+    const ImVec2 tp(mn.x + 25.0f, mn.y + (headerH - ts.y) * 0.5f);
+    draw->AddText(textFont, textSize, ImVec2(tp.x, tp.y + 1.0f),
+        IM_COL32(0, 0, 0, 180), label);
+    draw->AddText(textFont, textSize, tp, IM_COL32(242, 244, 248, 245), label);
 
-    // 4) VOLUTAS — fitas finas cruzando no sentido oposto: turbulência
-    {
-        const float k2 = kTau / C.volLam;
-        for (float x = mn.x; x <= mx.x; x += C.volStep) {
-            const float v = x * k2 - phaseX * 1.6f;
-            const float y = cy + 4.6f * sinf(v + 0.9f)
-                + 1.2f * sinf(v * 2.7f + t * 1.9f);
-            const float dens = 0.5f + 0.5f * sinf(v * 0.71f + 2.4f);
-            const float jv = (Hash01((int)(x * 5.1f)) - 0.5f) * C.volStep * 0.9f;
-            blob(x + jv, y, C.volR0 + (C.volR1 - C.volR0) * dens,
-                (C.volA0 + (C.volA1 - C.volA0) * dens) * edgeFade(x));
-        }
-    }
-
-    // 5) BOLHAS QUE SOBEM — pistas clássicas de fumaça
-    for (int i = 0; i < C.puffN; ++i) {
-        const float s1 = Hash01(i * 31 + 7), s2 = Hash01(i * 19 + 3);
-        const float cyc = fmodf(t * (0.20f + 0.14f * s2) + s1 * 7.0f, 1.0f);
-        const float x = WrapRange(mn.x + s2 * W + flow * 0.7f, mn.x, mx.x);
-        const float y = (mn.y + headerH - 3.0f) - cyc * (headerH + 6.0f);
-        const float r = C.puffR0 + (C.puffR1 - C.puffR0)
-            * (0.4f + 0.6f * sinf(3.1415927f * cyc));
-        const float a = (C.puffA0 + (C.puffA1 - C.puffA0) * s1)
-            * sinf(3.1415927f * cyc);
-        blob(x, y, r, a * edgeFade(x));      // nasce e morre suave (sem pipoco)
-    }
-
-    // 6) BORDAS — fumaça lambendo em cima e embaixo: o "abraço" no preto
-    for (float x = mn.x; x <= mx.x; x += C.edgeStep) {
-        const float v = x * k0 * 1.35f + phaseX * 1.2f;
-        const float aT = C.edgeA0 + (C.edgeA1 - C.edgeA0)
-            * fmaxf(0.0f, sinf(v * 0.61f + 0.6f));
-        const float aB = C.edgeA0 + (C.edgeA1 - C.edgeA0)
-            * fmaxf(0.0f, sinf(v * 0.61f + 3.3f));
-        const float je = (Hash01((int)(x * 7.9f)) - 0.5f) * C.edgeStep;
-        blob(x + je, mn.y + 3.0f, C.edgeR, aT);
-        blob(x + je, hmax.y - 3.0f, C.edgeR, aB);
-    }
-
-    // 7) FAÍSCAS — partículas claras que derivam
-    for (int i = 0; i < C.sparkN; ++i) {
-        const float s1 = Hash01(i * 17 + 2), s2 = Hash01(i * 23 + 11);
-        const float spd = 6.0f + 12.0f * s2;
-        const float x = WrapRange(mn.x + s1 * W + spd * t + flow * 0.9f,
-            mn.x, mx.x);
-        const float y = cy + sinf(t * (0.7f + 0.8f * s2) + s1 * kTau)
-            * (headerH * 0.30f);
-        const float a = C.sparkA0 + (C.sparkA1 - C.sparkA0)
-            * (0.5f + 0.5f * sinf(t * (1.1f + 1.3f * s1) + s2 * kTau));
-        blob(x, y, C.sparkR0 + (C.sparkR1 - C.sparkR0) * s2,
-            a * edgeFade(x));
-    }
-
-    // RÓTULO — SEM fundo: só o texto, com uma sombra fina para continuar
-    // legível quando a fumaça passa por baixo.
-    {
-        const ImVec2 ts = textFont->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, label);
-        const ImVec2 tpos(mn.x + padX, mn.y + (headerH - ts.y) * 0.5f);
-        draw->AddText(textFont, kLabelSize, ImVec2(tpos.x + 1.0f, tpos.y + 1.0f),
-            IM_COL32(0, 0, 0, 170), label);
-        draw->AddText(textFont, kLabelSize, tpos,
-            IM_COL32(255, 255, 255, 255), label);
-    }
+    // Três pontos decorativos no lado direito, estáticos e discretos.
+    const float dotsX = mx.x - 17.0f;
+    for (int i = 0; i < 3; ++i)
+        draw->AddCircleFilled(ImVec2(dotsX - i * 5.0f, mn.y + headerH * 0.5f),
+            1.0f, IM_COL32(255, 255, 255, 55 + i * 18), 8);
 
     draw->PopClipRect();
 
-    // Cantos de cima: devolve a curva do header por cima da fumaça — sem isso
-    // a fumaça (retangular) deixaria as pontas quadradas/pontudas por cima
-    // do raio do header.
+    // Restaura exatamente os cantos superiores arredondados após o clip.
     MaskTopCorners(draw, mn, mx, rounding, IM_COL32(0, 0, 0, 255));
 
-    // Divisória: traço cobrindo TODO o eixo X do card
-    const float divY = mn.y + headerH;
-    draw->AddLine(ImVec2(mn.x, divY), ImVec2(mx.x, divY), IM_COL32(150, 160, 175, 45), 1.0f);
+    // Divisor em duas camadas: sombra + linha clara bem fina.
+    const float divY = hmax.y;
+    draw->AddLine(ImVec2(mn.x + 1.0f, divY + 1.0f),
+        ImVec2(mx.x - 1.0f, divY + 1.0f), IM_COL32(0, 0, 0, 110), 1.0f);
+    draw->AddLine(ImVec2(mn.x + 1.0f, divY),
+        ImVec2(mx.x - 1.0f, divY), IM_COL32(150, 160, 178, 48), 1.0f);
     return divY;
 }
 
@@ -1176,6 +1494,38 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     draw->AddRect(mn, mx, IM_COL32(85, 85, 85, 80), rounding, 0, 1.0f);
 }
 
+// Símbolo vetorial de Yin Yang — construído somente com paths/círculos do
+// ImGui, sem textura ou fonte externa.
+static void DrawYinYang(ImDrawList* draw, const ImVec2& c, float r) {
+    const ImU32 light = IM_COL32(242, 244, 248, 255);
+    const ImU32 dark = IM_COL32(12, 13, 16, 255);
+    const float pi = 3.1415926535f;
+
+    // Halo discreto para separar o símbolo do fundo preto.
+    draw->AddCircleFilled(c, r + 3.0f, IM_COL32(255, 255, 255, 13), 48);
+
+    // Disco claro e metade direita escura.
+    draw->AddCircleFilled(c, r, light, 48);
+    draw->PathClear();
+    draw->PathLineTo(c);
+    draw->PathArcTo(c, r, -pi * 0.5f, pi * 0.5f, 28);
+    draw->PathFillConvex(dark);
+
+    // Curva em S formada por dois discos tangentes.
+    const float halfR = r * 0.5f;
+    const ImVec2 upper(c.x, c.y - halfR);
+    const ImVec2 lower(c.x, c.y + halfR);
+    draw->AddCircleFilled(upper, halfR, dark, 32);
+    draw->AddCircleFilled(lower, halfR, light, 32);
+
+    // Pontos opostos.
+    draw->AddCircleFilled(upper, r * 0.115f, light, 20);
+    draw->AddCircleFilled(lower, r * 0.115f, dark, 20);
+
+    // Contorno fino para preservar a silhueta em qualquer fundo.
+    draw->AddCircle(c, r, IM_COL32(255, 255, 255, 145), 48, 1.0f);
+}
+
 void DrawUI(HWND hWnd) {
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(kPanelW, kPanelH));
@@ -1204,19 +1554,16 @@ void DrawUI(HWND hWnd) {
         const ImVec2 ts = textFont->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, title);
 
         const float x0 = p.x + kTitlePadX;
-        const float logoH = kLogoSize;
-        const float topY = p.y + (48.0f - logoH) * 0.5f; // centraliza na faixa do topo (Y)
-        float textX = x0;
-        if (g_logoSRV) {
-            // proporção do recorte visível (sem as bordas transparentes)
-            const float logoW = logoH * ((float)g_logoW / (float)g_logoH);
-            draw->AddImage((ImTextureID)g_logoSRV,
-                ImVec2(x0, topY), ImVec2(x0 + logoW, topY + logoH),
-                g_logoUV0, g_logoUV1);
-            textX = x0 + logoW + kTitleGap;
-        }
-        draw->AddText(textFont, kLabelSize,
-            ImVec2(textX, topY + (logoH - ts.y) * 0.5f),
+        const float titleBarH = 48.0f;
+        const float symbolR = 13.0f;
+        const ImVec2 symbolCenter(x0 + symbolR, p.y + titleBarH * 0.5f);
+
+        // Arte vetorial à esquerda do nome.
+        DrawYinYang(draw, symbolCenter, symbolR);
+
+        const float textX = x0 + symbolR * 2.0f + 10.0f;
+        const float textY = p.y + (titleBarH - ts.y) * 0.5f;
+        draw->AddText(textFont, kLabelSize, ImVec2(textX, textY),
             IM_COL32(255, 255, 255, 255), title);
     }
 
@@ -1248,6 +1595,32 @@ void DrawUI(HWND hWnd) {
             const ImVec2 iMn(rmx.x - 16.0f - bW, by);
             DrawInjectControl(draw, iMn, ImVec2(iMn.x + bW, by + bH),
                 featMin, featMax);
+
+            // Segundo botão: 25 px abaixo do Inject, com as mesmas dimensões.
+            const float cleanY = by + bH + 25.0f;
+            const ImVec2 cMn(iMn.x, cleanY);
+            ImVec2 cleanMin, cleanMax;
+            DrawCleanControl(draw, cMn, ImVec2(cMn.x + bW, cleanY + bH),
+                cleanMin, cleanMax);
+            (void)cleanMin;
+
+            // A exclusão do drag cobre os dois controles e o espaço entre eles.
+            featMax = cleanMax;
+
+            // Checkbox Stream Proof no canto inferior esquerdo, exatamente
+            // 5 px acima do bottom do card.
+            const float checkH = 30.0f;
+            const float checkW = 156.0f;
+            const ImVec2 checkMin(rmn.x + 14.0f, rmx.y - 5.0f - checkH);
+            const ImVec2 checkMax(checkMin.x + checkW, rmx.y - 5.0f);
+            ImVec2 checkOutMin, checkOutMax;
+            DrawStreamProofCheckbox(draw, checkMin, checkMax,
+                checkOutMin, checkOutMax);
+            (void)checkOutMin;
+
+            // Mantém a largura de exclusão dos botões e estende apenas o Y
+            // até o checkbox, para o clique não iniciar o drag da janela.
+            featMax.y = checkOutMax.y;
 
             // borda por cima do header, igual ao card esquerdo
             draw->AddRect(rmn, rmx, IM_COL32(85, 85, 85, 80), kRounding, 0, 1.0f);
@@ -1304,9 +1677,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     EnableTransparency(hwnd);
 
-    ::ShowWindow(hwnd, nCmdShow);
-    ::UpdateWindow(hwnd);
-
+    // Inicializa todo o pipeline antes de exibir a janela. Assim o primeiro
+    // hover não coincide com a criação preguiçosa do atlas/shaders do backend.
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -1320,10 +1692,13 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     LoadFonts();
     FetchSystemInfo();
-    LoadLogoTexture();
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
+    ImGui_ImplDX11_CreateDeviceObjects(); // aquece shaders, buffers e atlas
+
+    ::ShowWindow(hwnd, nCmdShow);
+    ::UpdateWindow(hwnd);
 
     while (g_running) {
         MSG msg;
