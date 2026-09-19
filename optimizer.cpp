@@ -21,10 +21,10 @@
 #ifndef WIN32_LEAN_AND_MEAN
 #define WIN32_LEAN_AND_MEAN
 #endif
- 
+
 #define IMGUI_DISABLE_DEMO_WINDOWS
 #include "imgui.h"
- 
+
 #include "imgui_impl_win32.h"
 #include "imgui_impl_dx11.h"
 
@@ -521,7 +521,7 @@ static void DrawUI()
     ImGui::End();
 }
 
- 
+
 int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 {
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0L, 0L,
@@ -583,7 +583,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int)
 
         DrawUI();            // unica UI nossa
 
-       
+
 
         if (g_requestClose) done = true;
 
