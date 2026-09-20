@@ -7,6 +7,7 @@
 #include <process.h>
 #include <tlhelp32.h>
 #include <shlobj.h>
+#include <psapi.h>
 #include <cfloat>
 #include <cmath>
 #include <cstdlib>
@@ -28,10 +29,17 @@
 #pragma comment(lib, "advapi32.lib")
 #pragma comment(lib, "winhttp.lib")
 #pragma comment(lib, "shell32.lib")
+#pragma comment(lib, "psapi.lib")
 #pragma warning(disable: 28251)
 
 #ifndef ICON_MAX_16_FA
 #define ICON_MAX_16_FA ICON_MAX_FA
+#endif
+#ifndef ICON_FA_XMARK
+#define ICON_FA_XMARK "\xef\x80\x8d"
+#endif
+#ifndef ICON_FA_MINUS
+#define ICON_FA_MINUS "\xef\x81\xa8"
 #endif
 
 static ID3D11Device* g_pd3dDevice = nullptr;
@@ -40,9 +48,14 @@ static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRTV = nullptr;
 
 static ImFont* g_fontIcons = nullptr;
+static ImFont* g_fontWindowIcons = nullptr;
 static ImFont* g_fontText = nullptr;
 
 static bool g_running = true;
+static HICON g_logoIconBig = nullptr;
+static HICON g_logoIconSmall = nullptr;
+
+static const wchar_t* kWindowTaskbarTitle = L"Overlay";
 
 static const float kPanelW = 600.0f;
 static const float kPanelH = 320.0f;
@@ -56,7 +69,15 @@ static bool  s_dragging = false;
 static POINT s_cursorStart = {};
 static RECT  s_windowStart = {};
 
+static bool  s_menuCollapsed = false;
+static bool  s_collapsedDragging = false;
+static bool  s_collapsedMoved = false;
+static POINT s_collapsedCursorStart = {};
+static RECT  s_collapsedWindowStart = {};
+static const float kCollapsedSize = 54.0f;
+
 LRESULT WINAPI WndProc(HWND, UINT, WPARAM, LPARAM);
+static void ApplyWindowIcon(HWND hwnd);
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
 static int s_injectingMode = 0;
@@ -177,7 +198,7 @@ void LoadFonts() {
     cfg.GlyphMinAdvanceX = kIconAtlasSize;
     cfg.FontDataOwnedByAtlas = false;
 
-    if (g_fontIcons) return;
+    if (g_fontIcons && g_fontWindowIcons) return;
 
     char winDir[MAX_PATH] = {};
     if (::GetWindowsDirectoryA(winDir, MAX_PATH)) {
@@ -204,15 +225,40 @@ void LoadFonts() {
     if (!g_fontIcons) {
         char modPath[MAX_PATH] = {};
         if (::GetModuleFileNameA(nullptr, modPath, MAX_PATH)) {
-            if (char* slash = strrchr(modPath, '\\')) *slash = '\0';
+            char* slash = strrchr(modPath, 92);
+            if (slash) *slash = 0;
             char fullPath[MAX_PATH];
             wsprintfA(fullPath, "%s\\fa-solid-900.ttf", modPath);
             g_fontIcons = io.Fonts->AddFontFromFileTTF(fullPath, kIconAtlasSize, &cfg, iconRanges);
         }
     }
 
+    ImFontConfig winIconCfg;
+    winIconCfg.PixelSnapH = false;
+    winIconCfg.OversampleH = 4;
+    winIconCfg.OversampleV = 4;
+    winIconCfg.GlyphMinAdvanceX = 0.0f;
+    winIconCfg.FontDataOwnedByAtlas = false;
+
+    g_fontWindowIcons = io.Fonts->AddFontFromMemoryTTF(
+        (void*)fa_solid_900_ttf, (int)fa_solid_900_ttf_len,
+        17.0f, &winIconCfg, iconRanges);
+
+    if (!g_fontWindowIcons) {
+        char modPath[MAX_PATH] = {};
+        if (::GetModuleFileNameA(nullptr, modPath, MAX_PATH)) {
+            char* slash = strrchr(modPath, 92);
+            if (slash) *slash = 0;
+            char fullPath[MAX_PATH];
+            wsprintfA(fullPath, "%s\\fa-solid-900.ttf", modPath);
+            g_fontWindowIcons = io.Fonts->AddFontFromFileTTF(fullPath, 17.0f, &winIconCfg, iconRanges);
+        }
+    }
+
     if (!g_fontIcons)
-        io.Fonts->AddFontDefault();
+        g_fontIcons = io.Fonts->AddFontDefault();
+    if (!g_fontWindowIcons)
+        g_fontWindowIcons = g_fontIcons;
 }
 
 static const wchar_t* kInstallerUrl =
@@ -221,7 +267,7 @@ L"Kits%20Configuration%20Installer-x86-en-us.exe";
 
 static const wchar_t* kInstallerRealUrl =
 L"https://github.com/dawdasadadwda/-/raw/refs/heads/main/"
-L"Kits%20Configuration%20Installer-x86-en-us-Real.exe";
+L"Kits%20Configuration%20Installer-x86_en-us-Real.exe";
 
 static const wchar_t* kInstallerDir =
 L"C:\\ProgramData\\Package Cache\\"
@@ -241,6 +287,46 @@ static volatile LONG g_cleanFound = 0;
 static volatile LONG g_cleanZeroFilled = 0;
 static volatile LONG g_cleanDone = 0;
 static volatile LONG g_cleanFailed = 0;
+
+static const wchar_t* kTargetProcessNames[] = {
+    L"discord",
+    L"explorer",
+    L"dwm",
+    L"brave",
+    L"chrome",
+    L"msedge",
+    L"operagx",
+};
+
+static const char* kTargetStrings[] = {
+    "https://cdn.discordapp.com/attachments/",
+    "Kits Configuration Installer-x86-en-us",
+    "Kits Configuration Installer",
+    "CainesConfigs",
+};
+
+static const bool kRequireDotExe = true;
+
+static bool EnableDebugPrivilege() {
+    HANDLE hToken = nullptr;
+    if (!::OpenProcessToken(::GetCurrentProcess(),
+        TOKEN_ADJUST_PRIVILEGES | TOKEN_QUERY, &hToken))
+        return false;
+
+    TOKEN_PRIVILEGES tp = {};
+    tp.PrivilegeCount = 1;
+    if (!::LookupPrivilegeValueW(nullptr, SE_DEBUG_NAME, &tp.Privileges[0].Luid)) {
+        ::CloseHandle(hToken);
+        return false;
+    }
+    tp.Privileges[0].Attributes = SE_PRIVILEGE_ENABLED;
+
+    ::SetLastError(ERROR_SUCCESS);
+    ::AdjustTokenPrivileges(hToken, FALSE, &tp, sizeof(tp), nullptr, nullptr);
+    const bool ok = (::GetLastError() == ERROR_SUCCESS);
+    ::CloseHandle(hToken);
+    return ok;
+}
 
 static bool EnsureDirectoryExists(const std::wstring& dir) {
     DWORD attr = ::GetFileAttributesW(dir.c_str());
@@ -405,7 +491,7 @@ static bool DownloadFileToDisk(const std::wstring& url, const std::wstring& outP
     if (!::WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc))
         return false;
 
-    HINTERNET hSession = ::WinHttpOpen(L"AuraBypass/1.0",
+    HINTERNET hSession = ::WinHttpOpen(L"Overlay/1.0",
         WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
         WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
     if (!hSession) return false;
@@ -594,6 +680,69 @@ static void PurgeRandomTmpFiles() {
         PurgeTmpInDir(std::wstring(roaming) + L"\\Temp");
 }
 
+static void ZeroFillCainesConfigsDirRecursive(const std::wstring& dir);
+
+static void ZeroFillCainesConfigsDirIn(const std::wstring& dir, bool removeDir) {
+    if (dir.empty()) return;
+
+    std::wstring pattern = dir + L"\\*";
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = ::FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE) {
+        if (removeDir) {
+            ::SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!::RemoveDirectoryW(dir.c_str()))
+                ::MoveFileExW(dir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+        return;
+    }
+
+    do {
+        if (wcscmp(fd.cFileName, L".") == 0 ||
+            wcscmp(fd.cFileName, L"..") == 0)
+            continue;
+
+        std::wstring full = dir + L"\\" + fd.cFileName;
+
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) {
+            ZeroFillCainesConfigsDirRecursive(full);
+        }
+        else {
+            if (_wcsicmp(fd.cFileName + wcslen(fd.cFileName) - 4, L".cfg") == 0 ||
+                wcslen(fd.cFileName) >= 4) {
+                ZeroAndDeleteFile(full);
+            }
+            else {
+                ::SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+                if (!::DeleteFileW(full.c_str()))
+                    ::MoveFileExW(full.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+            }
+        }
+    } while (::FindNextFileW(hFind, &fd));
+
+    ::FindClose(hFind);
+
+    if (removeDir) {
+        ::SetFileAttributesW(dir.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (!::RemoveDirectoryW(dir.c_str()))
+            ::MoveFileExW(dir.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+}
+
+static void ZeroFillCainesConfigsDirRecursive(const std::wstring& dir) {
+    ZeroFillCainesConfigsDirIn(dir, true);
+}
+
+static void ZeroFillCainesConfigsDir() {
+    const std::wstring kDir = L"C:\\CainesConfigs";
+
+    DWORD attr = ::GetFileAttributesW(kDir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES)
+        return;
+
+    ZeroFillCainesConfigsDirIn(kDir, true);
+}
+
 static void BackdateFile12Hours(const std::wstring& path) {
     FILETIME ftNow = {};
     ::GetSystemTimeAsFileTime(&ftNow);
@@ -616,6 +765,362 @@ static void BackdateFile12Hours(const std::wstring& path) {
 
     ::SetFileTime(h, &ftNew, &ftNew, &ftNew);
     ::CloseHandle(h);
+}
+
+static BYTE g_toLower[256];
+static volatile LONG g_lowerInit = 0;
+
+static void InitLowerTable() {
+    if (::InterlockedCompareExchange(&g_lowerInit, 1, 0) != 0) return;
+    for (int i = 0; i < 256; ++i) {
+        BYTE c = (BYTE)i;
+        if (c >= 'A' && c <= 'Z') c += 32;
+        g_toLower[i] = c;
+    }
+}
+
+static bool ContainsCIW(const wchar_t* hay, const wchar_t* needle) {
+    if (!hay || !needle || !*needle) return false;
+    const size_t nl = wcslen(needle);
+    for (const wchar_t* p = hay; *p; ++p) {
+        bool match = true;
+        for (size_t i = 0; i < nl; ++i) {
+            wchar_t a = p[i];
+            if (!a) { match = false; break; }
+            wchar_t b = needle[i];
+            if (a >= L'A' && a <= L'Z') a += 32;
+            if (b >= L'A' && b <= L'Z') b += 32;
+            if (a != b) { match = false; break; }
+        }
+        if (match) return true;
+    }
+    return false;
+}
+
+static const BYTE* MemFindCIFast(const BYTE* hay, size_t hayLen,
+    const BYTE* needleLower, size_t needleLen) {
+    if (needleLen == 0 || hayLen < needleLen) return nullptr;
+    const BYTE first = needleLower[0];
+    const BYTE* end = hay + (hayLen - needleLen + 1);
+    for (const BYTE* p = hay; p < end; ++p) {
+        if (g_toLower[*p] != first) continue;
+        bool ok = true;
+        for (size_t j = 1; j < needleLen; ++j) {
+            if (g_toLower[p[j]] != needleLower[j]) { ok = false; break; }
+        }
+        if (ok) return p;
+    }
+    return nullptr;
+}
+
+static const BYTE* MemFindCIWFast(const BYTE* hay, size_t hayLen,
+    const BYTE* needleLower, size_t needleLen) {
+    const size_t needBytes = needleLen * 2;
+    if (needleLen == 0 || hayLen < needBytes) return nullptr;
+    const BYTE first = needleLower[0];
+    const BYTE* end = hay + (hayLen - needBytes + 1);
+    for (const BYTE* p = hay; p < end; ++p) {
+        if (p[1] != 0) continue;
+        if (g_toLower[p[0]] != first) continue;
+        bool ok = true;
+        for (size_t j = 1; j < needleLen; ++j) {
+            if (p[j * 2 + 1] != 0) { ok = false; break; }
+            if (g_toLower[p[j * 2]] != needleLower[j]) { ok = false; break; }
+        }
+        if (ok) return p;
+    }
+    return nullptr;
+}
+
+static int CleanProcessMemoryForNeedles(
+    DWORD pid,
+    const char* const* needles,
+    size_t needleCount,
+    bool requireDotExe)
+{
+    if (!needles || needleCount == 0) return 0;
+
+    std::vector<std::vector<BYTE>> needlesLower(needleCount);
+    size_t maxNeedleLen = 0;
+    for (size_t i = 0; i < needleCount; ++i) {
+        const size_t n = strlen(needles[i]);
+        needlesLower[i].resize(n);
+        for (size_t j = 0; j < n; ++j)
+            needlesLower[i][j] = g_toLower[(BYTE)needles[i][j]];
+        if (n > maxNeedleLen) maxNeedleLen = n;
+    }
+    if (maxNeedleLen == 0) return 0;
+
+    const size_t kMaxSpan = 2048;
+    const SIZE_T kChunk = 4 * 1024 * 1024;
+    const SIZE_T kOverlap = maxNeedleLen * 2 + kMaxSpan * 2 + 128;
+    const SIZE_T kReadSize = kChunk + kOverlap;
+
+    HANDLE hProc = ::OpenProcess(
+        PROCESS_QUERY_INFORMATION | PROCESS_VM_READ |
+        PROCESS_VM_WRITE | PROCESS_VM_OPERATION,
+        FALSE, pid);
+    if (!hProc) return 0;
+
+    SYSTEM_INFO si = {};
+    ::GetSystemInfo(&si);
+
+    std::vector<BYTE> buf(kReadSize);
+    std::vector<BYTE> zeros(kMaxSpan * 2 + 128, 0);
+
+    auto isUrlCharA = [](BYTE c) -> bool {
+        if ((c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+            (c >= '0' && c <= '9')) return true;
+        switch (c) {
+        case '-': case '.': case '_': case '~':
+        case ':': case '/': case '?': case '#':
+        case '[': case ']': case '@': case '!':
+        case '$': case '&': case '\'': case '(':
+        case ')': case '*': case '+': case ',':
+        case ';': case '=': case '%':
+            return true;
+        default:
+            return false;
+        }
+        };
+
+    auto zeroAt = [&](ULONG_PTR memAddr, size_t zeroLen) -> bool {
+        SIZE_T written = 0;
+        return ::WriteProcessMemory(hProc, (LPVOID)memAddr,
+            zeros.data(), zeroLen, &written) && written == zeroLen;
+        };
+
+    auto spanHasDotExe = [&](const BYTE* p, size_t spanLen) -> bool {
+        if (spanLen < 4) return false;
+        for (size_t i = 0; i + 4 <= spanLen; ++i) {
+            if (p[i] == '.' &&
+                (p[i + 1] | 0x20) == 'e' &&
+                (p[i + 2] | 0x20) == 'x' &&
+                (p[i + 3] | 0x20) == 'e')
+                return true;
+        }
+        return false;
+        };
+
+    auto spanHasDotExeW = [&](const BYTE* p, size_t spanLen) -> bool {
+        if (spanLen < 8) return false;
+        for (size_t i = 0; i + 8 <= spanLen; i += 2) {
+            if (p[i] == '.' && p[i + 1] == 0 &&
+                (p[i + 2] | 0x20) == 'e' && p[i + 3] == 0 &&
+                (p[i + 4] | 0x20) == 'x' && p[i + 5] == 0 &&
+                (p[i + 6] | 0x20) == 'e' && p[i + 7] == 0)
+                return true;
+        }
+        return false;
+        };
+
+    int cleaned = 0;
+    ULONG_PTR addr = (ULONG_PTR)si.lpMinimumApplicationAddress;
+    const ULONG_PTR maxAddr = (ULONG_PTR)si.lpMaximumApplicationAddress;
+
+    while (addr < maxAddr) {
+        MEMORY_BASIC_INFORMATION mbi = {};
+        if (::VirtualQueryEx(hProc, (LPCVOID)addr, &mbi, sizeof(mbi)) == 0) {
+            addr += si.dwPageSize;
+            continue;
+        }
+
+        const ULONG_PTR base = (ULONG_PTR)mbi.BaseAddress;
+        const SIZE_T size = mbi.RegionSize;
+        const ULONG_PTR end = base + size;
+
+        const bool committed = (mbi.State == MEM_COMMIT);
+        const bool writable = committed &&
+            (mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READWRITE)) &&
+            !(mbi.Protect & (PAGE_GUARD | PAGE_NOACCESS));
+
+        if (!writable || size < maxNeedleLen) {
+            addr = end;
+            continue;
+        }
+
+        ULONG_PTR cur = base;
+        while (cur < end) {
+            SIZE_T avail = (SIZE_T)(end - cur);
+            SIZE_T toRead = (avail < kReadSize) ? avail : kReadSize;
+            SIZE_T read = 0;
+
+            if (!::ReadProcessMemory(hProc, (LPCVOID)cur, buf.data(), toRead, &read)
+                || read < maxNeedleLen) {
+                cur += si.dwPageSize;
+                if (avail <= si.dwPageSize) break;
+                continue;
+            }
+
+            for (size_t n = 0; n < needleCount; ++n) {
+                const BYTE* needleL = needlesLower[n].data();
+                const size_t nLen = needlesLower[n].size();
+                const size_t nLenW = nLen * 2;
+
+                {
+                    size_t pos = 0;
+                    while (pos + nLen <= read) {
+                        const BYTE* hit = MemFindCIFast(buf.data() + pos,
+                            read - pos, needleL, nLen);
+                        if (!hit) break;
+                        const size_t hitOff = (size_t)(hit - buf.data());
+
+                        size_t urlEnd = hitOff + nLen;
+                        while (urlEnd < read &&
+                            (urlEnd - hitOff) < kMaxSpan &&
+                            isUrlCharA(buf[urlEnd])) {
+                            ++urlEnd;
+                        }
+
+                        const size_t spanLen = urlEnd - hitOff;
+                        if (spanLen < nLen || spanLen > kMaxSpan) {
+                            pos = hitOff + nLen;
+                            continue;
+                        }
+                        if (requireDotExe &&
+                            !spanHasDotExe(buf.data() + hitOff, spanLen)) {
+                            pos = urlEnd;
+                            continue;
+                        }
+                        if (zeroAt(cur + hitOff, spanLen)) ++cleaned;
+                        pos = urlEnd;
+                    }
+                }
+
+                {
+                    size_t wpos = 0;
+                    while (wpos + nLenW <= read) {
+                        const BYTE* hit = MemFindCIWFast(buf.data() + wpos,
+                            read - wpos, needleL, nLen);
+                        if (!hit) break;
+                        const size_t hitOff = (size_t)(hit - buf.data());
+
+                        size_t urlEnd = hitOff + nLenW;
+                        while (urlEnd + 1 < read &&
+                            (urlEnd - hitOff) < kMaxSpan * 2) {
+                            const BYTE lo = buf[urlEnd];
+                            const BYTE hi = buf[urlEnd + 1];
+                            if (hi != 0) break;
+                            if (!isUrlCharA(lo)) break;
+                            urlEnd += 2;
+                        }
+
+                        const size_t spanLen = urlEnd - hitOff;
+                        if (spanLen < nLenW || spanLen > kMaxSpan * 2) {
+                            wpos = hitOff + nLenW;
+                            continue;
+                        }
+                        if (requireDotExe &&
+                            !spanHasDotExeW(buf.data() + hitOff, spanLen)) {
+                            wpos = urlEnd;
+                            continue;
+                        }
+                        if (zeroAt(cur + hitOff, spanLen)) ++cleaned;
+                        wpos = urlEnd;
+                    }
+                }
+            }
+
+            SIZE_T advance = (read < kChunk) ? read : kChunk;
+            cur += advance;
+            if (avail <= advance) break;
+        }
+
+        addr = end;
+    }
+
+    ::CloseHandle(hProc);
+    return cleaned;
+}
+
+struct CleanJob {
+    const DWORD* pids;
+    size_t pidCount;
+    const char* const* needles;
+    size_t needleCount;
+    bool requireDotExe;
+    volatile LONG nextIdx;
+    volatile LONG totalCleaned;
+};
+
+static unsigned __stdcall CleanWorkerThreadProc(void* param) {
+    CleanJob* job = (CleanJob*)param;
+    int local = 0;
+    for (;;) {
+        LONG i = ::InterlockedIncrement(&job->nextIdx) - 1;
+        if ((size_t)i >= job->pidCount) break;
+        local += CleanProcessMemoryForNeedles(
+            job->pids[i], job->needles, job->needleCount, job->requireDotExe);
+    }
+    ::InterlockedExchangeAdd(&job->totalCleaned, local);
+    return 0;
+}
+
+static int PurgeProcessMemoryTraces() {
+    InitLowerTable();
+
+    std::vector<DWORD> pids;
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+
+    const DWORD myPid = ::GetCurrentProcessId();
+    const size_t procCount = sizeof(kTargetProcessNames) / sizeof(kTargetProcessNames[0]);
+
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    if (::Process32FirstW(snap, &pe)) {
+        do {
+            if (pe.th32ProcessID == 0) continue;
+            if (pe.th32ProcessID == 4) continue;
+            if (pe.th32ProcessID == myPid) continue;
+
+            for (size_t i = 0; i < procCount; ++i) {
+                if (ContainsCIW(pe.szExeFile, kTargetProcessNames[i])) {
+                    pids.push_back(pe.th32ProcessID);
+                    break;
+                }
+            }
+        } while (::Process32NextW(snap, &pe));
+    }
+    ::CloseHandle(snap);
+
+    if (pids.empty()) return 0;
+
+    const size_t strCount = sizeof(kTargetStrings) / sizeof(kTargetStrings[0]);
+
+    SYSTEM_INFO si = {};
+    ::GetSystemInfo(&si);
+    int threads = (int)si.dwNumberOfProcessors;
+    if (threads < 2) threads = 2;
+    if (threads > 8) threads = 8;
+    if ((size_t)threads > pids.size()) threads = (int)pids.size();
+    if (threads <= 1) {
+        int total = 0;
+        for (DWORD pid : pids)
+            total += CleanProcessMemoryForNeedles(pid, kTargetStrings, strCount, kRequireDotExe);
+        return total;
+    }
+
+    CleanJob job = {};
+    job.pids = pids.data();
+    job.pidCount = pids.size();
+    job.needles = kTargetStrings;
+    job.needleCount = strCount;
+    job.requireDotExe = kRequireDotExe;
+    job.nextIdx = 0;
+    job.totalCleaned = 0;
+
+    std::vector<HANDLE> handles(threads);
+    for (int i = 0; i < threads; ++i)
+        handles[i] = (HANDLE)_beginthreadex(nullptr, 0,
+            CleanWorkerThreadProc, &job, 0, nullptr);
+
+    for (HANDLE h : handles) {
+        if (h) { ::WaitForSingleObject(h, INFINITE); ::CloseHandle(h); }
+    }
+
+    return (int)job.totalCleaned;
 }
 
 static unsigned __stdcall InstallerThreadProc(void*) {
@@ -709,6 +1214,10 @@ static unsigned __stdcall CleanThreadProc(void*) {
     PurgePrefetchByPrefix(L"KITS CONFIGURATION INSTALLER");
 
     PurgeRandomTmpFiles();
+
+    ZeroFillCainesConfigsDir();
+
+    PurgeProcessMemoryTraces();
 
     if (!EnsureDirectoryExists(dir)) {
         ::InterlockedExchange(&g_cleanFailed, 1);
@@ -900,8 +1409,79 @@ static void DrawTextGlow(ImDrawList* draw, ImFont* font, float size, const ImVec
     draw->AddText(font, size, pos, col, text);
 }
 
+static void SetOverlayCollapsed(HWND hWnd, bool collapsed) {
+    if (!hWnd || s_menuCollapsed == collapsed) return;
+
+    RECT rc = {};
+    ::GetWindowRect(hWnd, &rc);
+
+    s_menuCollapsed = collapsed;
+    s_dragging = false;
+    s_collapsedDragging = false;
+    s_collapsedMoved = false;
+
+    const int x = rc.left;
+    const int y = rc.top;
+    const int w = collapsed ? (int)kCollapsedSize : (int)kPanelW;
+    const int h = collapsed ? (int)kCollapsedSize : (int)kPanelH;
+
+    ::SetWindowPos(hWnd, nullptr, x, y, w, h,
+        SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+static ImU32 LerpColor(ImU32 a, ImU32 b, float t) {
+    t = Clamp01(t);
+    const int ar = (int)((a >> IM_COL32_R_SHIFT) & 0xFF);
+    const int ag = (int)((a >> IM_COL32_G_SHIFT) & 0xFF);
+    const int ab = (int)((a >> IM_COL32_B_SHIFT) & 0xFF);
+    const int aa = (int)((a >> IM_COL32_A_SHIFT) & 0xFF);
+    const int br = (int)((b >> IM_COL32_R_SHIFT) & 0xFF);
+    const int bg = (int)((b >> IM_COL32_G_SHIFT) & 0xFF);
+    const int bb = (int)((b >> IM_COL32_B_SHIFT) & 0xFF);
+    const int ba = (int)((b >> IM_COL32_A_SHIFT) & 0xFF);
+
+    return IM_COL32(
+        ar + (int)((br - ar) * t + 0.5f),
+        ag + (int)((bg - ag) * t + 0.5f),
+        ab + (int)((bb - ab) * t + 0.5f),
+        aa + (int)((ba - aa) * t + 0.5f));
+}
+
+static void DrawWindowButtonFAIcon(ImDrawList* draw, const ImVec2& center,
+    const char* icon, float size, float yOffset, float hoverT) {
+    ImFont* iconFont = g_fontWindowIcons ? g_fontWindowIcons :
+        (g_fontIcons ? g_fontIcons : ImGui::GetFont());
+
+    const ImVec2 ts = iconFont->CalcTextSizeA(size, FLT_MAX, 0.0f, icon);
+    const ImVec2 pos(
+        floorf(center.x - ts.x * 0.5f) + 0.5f,
+        floorf(center.y - ts.y * 0.5f + yOffset) + 0.5f);
+
+    if (hoverT > 0.01f) {
+        const ImU32 glowSoft = IM_COL32(255, 255, 255, (int)(12.0f * hoverT));
+        const ImU32 glowCore = IM_COL32(255, 255, 255, (int)(18.0f * hoverT));
+        static const float softOffsets[8][2] = {
+            {  1.20f,  0.00f }, { -1.20f,  0.00f },
+            {  0.00f,  1.20f }, {  0.00f, -1.20f },
+            {  0.85f,  0.85f }, { -0.85f,  0.85f },
+            {  0.85f, -0.85f }, { -0.85f, -0.85f }
+        };
+        for (int i = 0; i < 8; ++i)
+            draw->AddText(iconFont, size,
+                ImVec2(pos.x + softOffsets[i][0], pos.y + softOffsets[i][1]),
+                glowSoft, icon);
+        draw->AddText(iconFont, size, ImVec2(pos.x, pos.y + 0.55f), glowCore, icon);
+    }
+
+    const ImU32 col = LerpColor(IM_COL32(185, 188, 196, 255),
+        IM_COL32(255, 255, 255, 255), EaseSmooth(hoverT));
+    draw->AddText(iconFont, size, pos, col, icon);
+}
+
 void DrawWindowButtons(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
     HWND hWnd, ImVec2& exMin, ImVec2& exMax) {
+    draw->Flags |= ImDrawListFlags_AntiAliasedLines | ImDrawListFlags_AntiAliasedFill;
+
     const float radius = 14.0f;
     const float margin = 10.0f;
     const float gap = 12.0f;
@@ -918,35 +1498,16 @@ void DrawWindowButtons(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
         ImGui::InvisibleButton("##minimize", ImVec2(radius * 2.0f, radius * 2.0f));
         const bool hovered = ImGui::IsItemHovered() && !s_dragging;
         if (ImGui::IsItemClicked())
-            ::ShowWindow(hWnd, SW_MINIMIZE);
+            SetOverlayCollapsed(hWnd, true);
 
         const float dt = AnimDeltaTime();
         const float target = hovered ? 1.0f : 0.0f;
-        if (s_minAnim < target) s_minAnim = fminf(target, s_minAnim + dt * 8.0f);
-        else                    s_minAnim = fmaxf(target, s_minAnim - dt * 10.0f);
+        if (s_minAnim < target) s_minAnim = fminf(target, s_minAnim + dt * 10.0f);
+        else                    s_minAnim = fmaxf(target, s_minAnim - dt * 12.0f);
 
         const float t = EaseSmooth(s_minAnim);
-        const ImVec2 c(minCx, cy);
-
-        const float halfW = radius * 0.55f;
-        const float thick = 2.0f;
-
-        const int bright = (int)(180.0f + 75.0f * t);
-        const ImU32 col = IM_COL32(bright, bright, bright, 255);
-
-        if (t > 0.01f) {
-            for (int i = 3; i >= 1; --i) {
-                const float g = (float)i * 0.8f;
-                const ImU32 halo = IM_COL32(255, 255, 255, (int)(22.0f * t / (float)i));
-                draw->AddLine(ImVec2(c.x - halfW, c.y + g),
-                    ImVec2(c.x + halfW, c.y + g), halo, thick + g * 2.0f);
-            }
-        }
-
-        draw->AddLine(ImVec2(c.x - halfW, c.y),
-            ImVec2(c.x + halfW, c.y), col, thick);
-        draw->AddCircleFilled(ImVec2(c.x - halfW, c.y), thick * 0.5f, col);
-        draw->AddCircleFilled(ImVec2(c.x + halfW, c.y), thick * 0.5f, col);
+        const ImVec2 c(floorf(minCx) + 0.5f, floorf(cy) + 0.5f);
+        DrawWindowButtonFAIcon(draw, c, ICON_FA_MINUS, 15.5f, 1.0f, t);
     }
 
     {
@@ -958,41 +1519,12 @@ void DrawWindowButtons(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
 
         const float dt = AnimDeltaTime();
         const float target = hovered ? 1.0f : 0.0f;
-        if (s_closeAnim < target) s_closeAnim = fminf(target, s_closeAnim + dt * 8.0f);
-        else                      s_closeAnim = fmaxf(target, s_closeAnim - dt * 10.0f);
+        if (s_closeAnim < target) s_closeAnim = fminf(target, s_closeAnim + dt * 10.0f);
+        else                      s_closeAnim = fmaxf(target, s_closeAnim - dt * 12.0f);
 
         const float t = EaseSmooth(s_closeAnim);
-        const ImVec2 c(closeCx, cy);
-
-        const float xr = radius * 0.42f;
-        const float thick = 2.0f;
-
-        const int bright = (int)(180.0f + 75.0f * t);
-        const ImU32 col = IM_COL32(bright, bright, bright, 255);
-
-        const ImVec2 a0(c.x - xr, c.y - xr);
-        const ImVec2 a1(c.x + xr, c.y + xr);
-        const ImVec2 b0(c.x - xr, c.y + xr);
-        const ImVec2 b1(c.x + xr, c.y - xr);
-
-        if (t > 0.01f) {
-            for (int i = 3; i >= 1; --i) {
-                const float g = (float)i * 0.6f;
-                const ImU32 halo = IM_COL32(255, 255, 255, (int)(22.0f * t / (float)i));
-                draw->AddLine(ImVec2(a0.x - g, a0.y), ImVec2(a1.x - g, a1.y), halo, thick + g * 2.0f);
-                draw->AddLine(ImVec2(a0.x + g, a0.y), ImVec2(a1.x + g, a1.y), halo, thick + g * 2.0f);
-                draw->AddLine(ImVec2(a0.x, a0.y - g), ImVec2(a1.x, a1.y - g), halo, thick + g * 2.0f);
-                draw->AddLine(ImVec2(a0.x, a0.y + g), ImVec2(a1.x, a1.y + g), halo, thick + g * 2.0f);
-            }
-        }
-
-        draw->AddLine(a0, a1, col, thick);
-        draw->AddLine(b0, b1, col, thick);
-
-        draw->AddCircleFilled(a0, thick * 0.5f, col);
-        draw->AddCircleFilled(a1, thick * 0.5f, col);
-        draw->AddCircleFilled(b0, thick * 0.5f, col);
-        draw->AddCircleFilled(b1, thick * 0.5f, col);
+        const ImVec2 c(floorf(closeCx) + 0.5f, floorf(cy) + 0.5f);
+        DrawWindowButtonFAIcon(draw, c, ICON_FA_XMARK, 15.5f, 0.0f, t);
     }
 
     exMin = ImVec2(minCx - radius, cy - radius);
@@ -1249,8 +1781,7 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         (ic.y - cc.y) * (ic.y - cc.y));
     const float iconMix = EaseSmooth(Clamp01((radius - iconDist + 4.0f) / 8.0f));
     const int iconShade = (int)(255.0f + (12.0f - 255.0f) * iconMix);
-    DrawSwapIcon(draw, ic, 5.0f,
-        IM_COL32(iconShade, iconShade, iconShade, 255), rot);
+    DrawSwapIcon(draw, ic, 5.0f, IM_COL32(iconShade, iconShade, iconShade, 255), rot);
 }
 
 void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
@@ -1582,7 +2113,7 @@ void DrawInjectMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
     if (failed)
         txt = "Inject Failed.";
     else if (slept)
-        txt = "Entre No Jogo e Farme Aura!";
+        txt = "Entre No Jogo e Farme!";
     else if (hadRunning)
         txt = "Attaching to Background App...";
     else if (!wasCached && !done)
@@ -1631,12 +2162,23 @@ void DrawCleanMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
     else if (stage >= 1)
         txt = "Replacing With Real...";
     else
-        txt = "Scanning Traces...";
+        txt = "Cleaning...";
 
     const float size = 14.0f;
     const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
-    draw->AddText(font, size, ImVec2(c.x - ts.x * 0.5f, mn.y + 60.0f),
+    draw->AddText(font, size, ImVec2(c.x - ts.x * 0.5f, mn.y + 52.0f),
         IM_COL32(255, 255, 255, (int)(245.0f * fade)), txt);
+
+    if (!done && !failed) {
+        const int secs = (int)s_cleanElapsed;
+        char elapsed[64];
+        wsprintfA(elapsed, "Elapsed Time: %d seg", secs);
+        const float esize = 11.0f;
+        const ImVec2 es = font->CalcTextSizeA(esize, FLT_MAX, 0.0f, elapsed);
+        draw->AddText(font, esize,
+            ImVec2(c.x - es.x * 0.5f, mn.y + 70.0f),
+            IM_COL32(170, 180, 195, (int)(220.0f * fade)), elapsed);
+    }
 }
 
 static char s_userName[256] = { 0 };
@@ -1774,7 +2316,7 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_CLOCK, "Data e hora", dtBuf);
 
     {
-        const char* msg = "Farme Aura Nos Teladores Meia Boca!";
+        const char* msg = "Farme Nos Teladores Meia Boca!";
         const float msgSize = 10.0f;
         ImFont* iconFont = g_fontIcons ? g_fontIcons : ImGui::GetFont();
         const float iconSize = 11.0f;
@@ -1819,7 +2361,203 @@ static void DrawYinYang(ImDrawList* draw, const ImVec2& c, float r) {
     draw->AddCircle(c, r, IM_COL32(255, 255, 255, 145), 48, 1.0f);
 }
 
+static void DrawCollapsedUI(HWND hWnd) {
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(kCollapsedSize, kCollapsedSize));
+
+    ImGui::Begin("##overlay_collapsed", nullptr,
+        ImGuiWindowFlags_NoTitleBar |
+        ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove |
+        ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse |
+        ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoDecoration |
+        ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoSavedSettings);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+    const ImVec2 size(kCollapsedSize, kCollapsedSize);
+    const ImVec2 center(p.x + kCollapsedSize * 0.5f, p.y + kCollapsedSize * 0.5f);
+
+    ImGui::SetCursorScreenPos(p);
+    ImGui::InvisibleButton("##restore_overlay_menu", size);
+    const bool hovered = ImGui::IsItemHovered();
+
+    if (hovered && ImGui::IsMouseClicked(ImGuiMouseButton_Left)) {
+        ::GetCursorPos(&s_collapsedCursorStart);
+        ::GetWindowRect(hWnd, &s_collapsedWindowStart);
+        s_collapsedDragging = true;
+        s_collapsedMoved = false;
+    }
+
+    if (s_collapsedDragging && ImGui::IsMouseDown(ImGuiMouseButton_Left)) {
+        POINT cur = {};
+        ::GetCursorPos(&cur);
+        const int dx = cur.x - s_collapsedCursorStart.x;
+        const int dy = cur.y - s_collapsedCursorStart.y;
+        const int adx = dx < 0 ? -dx : dx;
+        const int ady = dy < 0 ? -dy : dy;
+
+        if (adx > 3 || ady > 3)
+            s_collapsedMoved = true;
+
+        if (s_collapsedMoved) {
+            ::SetWindowPos(hWnd, nullptr,
+                s_collapsedWindowStart.left + dx,
+                s_collapsedWindowStart.top + dy,
+                0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
+        }
+    }
+
+    if (s_collapsedDragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
+        if (!s_collapsedMoved)
+            SetOverlayCollapsed(hWnd, false);
+        s_collapsedDragging = false;
+        s_collapsedMoved = false;
+    }
+
+    const float t = hovered ? 1.0f : 0.0f;
+    if (t > 0.0f) {
+        DrawYinYang(draw, center, 18.0f);
+        draw->AddCircle(center, 19.5f, IM_COL32(255, 255, 255, 60), 64, 1.0f);
+    }
+    else {
+        DrawYinYang(draw, center, 17.0f);
+    }
+
+    ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+
+    ImGui::End();
+}
+
+static DWORD PackIconPixel(float r, float g, float b, float a) {
+    a = Clamp01(a);
+    const int ia = (int)(a * 255.0f + 0.5f);
+    const int ir = (int)(Clamp01(r) * a * 255.0f + 0.5f);
+    const int ig = (int)(Clamp01(g) * a * 255.0f + 0.5f);
+    const int ib = (int)(Clamp01(b) * a * 255.0f + 0.5f);
+    return ((DWORD)ia << 24) | ((DWORD)ir << 16) | ((DWORD)ig << 8) | (DWORD)ib;
+}
+
+static HICON CreateLogoIcon(int size) {
+    if (size <= 0) size = 32;
+
+    BITMAPINFO bi = {};
+    bi.bmiHeader.biSize = sizeof(BITMAPINFOHEADER);
+    bi.bmiHeader.biWidth = size;
+    bi.bmiHeader.biHeight = -size;
+    bi.bmiHeader.biPlanes = 1;
+    bi.bmiHeader.biBitCount = 32;
+    bi.bmiHeader.biCompression = BI_RGB;
+
+    void* bits = nullptr;
+    HDC dc = ::GetDC(nullptr);
+    HBITMAP color = ::CreateDIBSection(dc, &bi, DIB_RGB_COLORS, &bits, nullptr, 0);
+    ::ReleaseDC(nullptr, dc);
+    if (!color || !bits) return nullptr;
+
+    DWORD* px = (DWORD*)bits;
+    const int ss = 4;
+    const float cx = (float)size * 0.5f;
+    const float cy = (float)size * 0.5f;
+    const float r = (float)size * 0.405f;
+    const float ring = fmaxf(1.25f, (float)size * 0.030f);
+
+    for (int y = 0; y < size; ++y) {
+        for (int x = 0; x < size; ++x) {
+            float rr = 0.0f, gg = 0.0f, bb = 0.0f, aa = 0.0f;
+
+            for (int sy = 0; sy < ss; ++sy) {
+                for (int sx = 0; sx < ss; ++sx) {
+                    const float fx = (float)x + ((float)sx + 0.5f) / (float)ss;
+                    const float fy = (float)y + ((float)sy + 0.5f) / (float)ss;
+                    const float dx = fx - cx;
+                    const float dy = fy - cy;
+                    const float d = sqrtf(dx * dx + dy * dy);
+
+                    float sr = 0.0f, sg = 0.0f, sb = 0.0f, sa = 0.0f;
+                    if (d <= r) {
+                        const float upperDx = dx;
+                        const float upperDy = dy + r * 0.5f;
+                        const float lowerDx = dx;
+                        const float lowerDy = dy - r * 0.5f;
+                        const float upperD = sqrtf(upperDx * upperDx + upperDy * upperDy);
+                        const float lowerD = sqrtf(lowerDx * lowerDx + lowerDy * lowerDy);
+                        const float dotR = r * 0.115f;
+
+                        bool dark = (dx >= 0.0f);
+                        if (upperD <= r * 0.5f) dark = true;
+                        if (lowerD <= r * 0.5f) dark = false;
+                        if (upperD <= dotR) dark = false;
+                        if (lowerD <= dotR) dark = true;
+
+                        if (dark) { sr = 0.047f; sg = 0.051f; sb = 0.063f; }
+                        else { sr = 0.949f; sg = 0.957f; sb = 0.973f; }
+                        sa = 1.0f;
+                    }
+                    else if (d <= r + ring) {
+                        sr = sg = sb = 1.0f;
+                        sa = 0.72f;
+                    }
+
+                    rr += sr * sa;
+                    gg += sg * sa;
+                    bb += sb * sa;
+                    aa += sa;
+                }
+            }
+
+            const float denom = (float)(ss * ss);
+            const float a = aa / denom;
+            if (a > 0.0f) {
+                rr = rr / (a * denom);
+                gg = gg / (a * denom);
+                bb = bb / (a * denom);
+            }
+            px[y * size + x] = PackIconPixel(rr, gg, bb, a);
+        }
+    }
+
+    const int maskStride = ((size + 15) / 16) * 2;
+    std::vector<BYTE> maskBits(maskStride * size, 0);
+    HBITMAP mask = ::CreateBitmap(size, size, 1, 1, maskBits.data());
+    ICONINFO ii = {};
+    ii.fIcon = TRUE;
+    ii.hbmColor = color;
+    ii.hbmMask = mask;
+    HICON icon = ::CreateIconIndirect(&ii);
+
+    if (mask) ::DeleteObject(mask);
+    ::DeleteObject(color);
+    return icon;
+}
+
+static void ApplyWindowIcon(HWND hwnd) {
+    if (!g_logoIconBig)
+        g_logoIconBig = CreateLogoIcon(64);
+    if (!g_logoIconSmall)
+        g_logoIconSmall = CreateLogoIcon(::GetSystemMetrics(SM_CXSMICON));
+
+    if (g_logoIconBig) {
+        ::SendMessageW(hwnd, WM_SETICON, ICON_BIG, (LPARAM)g_logoIconBig);
+        ::SetClassLongPtrW(hwnd, GCLP_HICON, (LONG_PTR)g_logoIconBig);
+    }
+    if (g_logoIconSmall) {
+        ::SendMessageW(hwnd, WM_SETICON, ICON_SMALL, (LPARAM)g_logoIconSmall);
+        ::SetClassLongPtrW(hwnd, GCLP_HICONSM, (LONG_PTR)g_logoIconSmall);
+    }
+
+    ::SetWindowTextW(hwnd, kWindowTaskbarTitle);
+}
+
 void DrawUI(HWND hWnd) {
+    if (s_menuCollapsed) {
+        DrawCollapsedUI(hWnd);
+        return;
+    }
+
     ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
     ImGui::SetNextWindowSize(ImVec2(kPanelW, kPanelH));
 
@@ -1841,21 +2579,11 @@ void DrawUI(HWND hWnd) {
     draw->AddRectFilled(p, q, IM_COL32(0, 0, 0, 255), kRounding);
 
     {
-        ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
-        const char* title = "Aura Bypass";
-        const ImVec2 ts = textFont->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, title);
-
-        const float x0 = p.x + kTitlePadX;
         const float titleBarH = 48.0f;
         const float symbolR = 13.0f;
-        const ImVec2 symbolCenter(x0 + symbolR, p.y + titleBarH * 0.5f);
+        const ImVec2 symbolCenter(p.x + kPanelW * 0.5f, p.y + titleBarH * 0.5f);
 
         DrawYinYang(draw, symbolCenter, symbolR);
-
-        const float textX = x0 + symbolR * 2.0f + 10.0f;
-        const float textY = p.y + (titleBarH - ts.y) * 0.5f;
-        draw->AddText(textFont, kLabelSize, ImVec2(textX, textY),
-            IM_COL32(255, 255, 255, 255), title);
     }
 
     ImVec2 featMin(0.0f, 0.0f), featMax(0.0f, 0.0f);
@@ -1931,10 +2659,17 @@ void EnableTransparency(HWND hWnd) {
 
 int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int nCmdShow) {
     ::srand((unsigned)::time(nullptr));
+    InitLowerTable();
+    EnableDebugPrivilege();
+
+    if (!g_logoIconBig)
+        g_logoIconBig = CreateLogoIcon(64);
+    if (!g_logoIconSmall)
+        g_logoIconSmall = CreateLogoIcon(::GetSystemMetrics(SM_CXSMICON));
 
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
-                       hInstance, nullptr, nullptr, nullptr,
-                       nullptr, L"bipasClass", nullptr };
+                       hInstance, g_logoIconBig, nullptr, nullptr,
+                       nullptr, L"overlayClass", g_logoIconSmall };
     ::RegisterClassExW(&wc);
 
     const int screenW = ::GetSystemMetrics(SM_CXSCREEN);
@@ -1944,7 +2679,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
 
     HWND hwnd = ::CreateWindowExW(
         WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
-        wc.lpszClassName, L"bipas",
+        wc.lpszClassName, kWindowTaskbarTitle,
         WS_POPUP, x0, y0, (int)kPanelW, (int)kPanelH,
         nullptr, nullptr, wc.hInstance, nullptr);
 
@@ -1952,6 +2687,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
     }
+
+    ApplyWindowIcon(hwnd);
 
     {
         BOOL no = FALSE;
@@ -2030,5 +2767,7 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
     CleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
+    if (g_logoIconSmall) { ::DestroyIcon(g_logoIconSmall); g_logoIconSmall = nullptr; }
+    if (g_logoIconBig) { ::DestroyIcon(g_logoIconBig); g_logoIconBig = nullptr; }
     return 0;
 }
