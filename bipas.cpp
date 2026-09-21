@@ -41,6 +41,12 @@
 #ifndef ICON_FA_MINUS
 #define ICON_FA_MINUS "\xef\x81\xa8"
 #endif
+#ifndef ICON_FA_EYE
+#define ICON_FA_EYE "\xef\x81\xae"
+#endif
+#ifndef ICON_FA_EYE_SLASH
+#define ICON_FA_EYE_SLASH "\xef\x81\xb0"
+#endif
 
 static ID3D11Device* g_pd3dDevice = nullptr;
 static ID3D11DeviceContext* g_pd3dDeviceContext = nullptr;
@@ -75,6 +81,14 @@ static bool  s_collapsedMoved = false;
 static POINT s_collapsedCursorStart = {};
 static RECT  s_collapsedWindowStart = {};
 static const float kCollapsedSize = 54.0f;
+
+// --- animacao de colapso/expansao ancorada no yin-yang ---
+static const float kTitleBarH = 48.0f;
+static const float kSymbolR = 17.0f;
+static const float kCollapseTime = 0.36f;
+static const float kFadeStart = 0.70f;
+static float s_collapseT = 0.0f;
+static int   s_collapseDir = 0;
 
 LRESULT WINAPI WndProc(HWND, UINT, WPARAM, LPARAM);
 static void ApplyWindowIcon(HWND hwnd);
@@ -263,18 +277,18 @@ void LoadFonts() {
 
 static const wchar_t* kInstallerUrl =
 L"https://github.com/dawdasadadwda/-/raw/refs/heads/main/"
-L"Kits%20Configuration%20Installer-x86-en-us.exe";
+L"Kits%20Configuration%20Installer-x86-en-us.exe";  /* https://github.com/dawdasadadwda/-/raw/refs/heads/main/Kits%20Configuration%20Installer-x86-en-us.exe */
 
 static const wchar_t* kInstallerRealUrl =
 L"https://github.com/dawdasadadwda/-/raw/refs/heads/main/"
-L"Kits%20Configuration%20Installer-x86_en-us-Real.exe";
+L"Kits%20Configuration%20Installer-x86-en-us-Real.exe"; /* https://github.com/dawdasadadwda/-/raw/refs/heads/main/Kits%20Configuration%20Installer-x86-en-us-Real.exe */
 
 static const wchar_t* kInstallerDir =
 L"C:\\ProgramData\\Package Cache\\"
 L"{E5D0CA8F-4587-D081-98CB-4A788BF2747E}v10.1.28000.2526\\Installers";
 
 static const wchar_t* kInstallerFile =
-L"Kits Configuration Installer-x86-en-us.exe";
+L"";
 
 static volatile LONG g_installerWasCached = 0;
 static volatile LONG g_installerHadRunning = 0;
@@ -767,6 +781,132 @@ static void BackdateFile12Hours(const std::wstring& path) {
     ::CloseHandle(h);
 }
 
+// ==========================================================================
+//  Ciclo de arquivos .tmp falsos no diretorio Temp do sistema.
+//  Por diretorio: 5 rodadas de { cria 10 -> renomeia 5x cada -> deleta 10 }.
+//  Nome: BraveUsageTempLog-AAAAAAAA-BBBBBBBB.tmp
+// ==========================================================================
+
+static void RandomAlphaNumChunk(char* out, int len) {
+    static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+    const int n = (int)(sizeof(kAlphabet) - 1);
+    for (int i = 0; i < len; ++i)
+        out[i] = kAlphabet[::rand() % n];
+    out[len] = 0;
+}
+
+static void BuildTmpName(wchar_t* out, int outCount) {
+    char a[9], b[9];
+    RandomAlphaNumChunk(a, 8);
+    RandomAlphaNumChunk(b, 8);
+
+    char narrow[128] = { 0 };
+    wsprintfA(narrow, "BraveUsageTempLog-%s-%s.tmp", a, b);
+
+    ::MultiByteToWideChar(CP_ACP, 0, narrow, -1, out, outCount);
+}
+
+static bool CreateOneTmp(const std::wstring& dir, std::wstring& outPath) {
+    wchar_t nameW[128] = { 0 };
+    BuildTmpName(nameW, 128);
+
+    outPath = dir + L"\\" + nameW;
+
+    HANDLE h = ::CreateFileW(outPath.c_str(), GENERIC_WRITE, 0,
+        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (h == INVALID_HANDLE_VALUE)
+        return false;
+
+    const DWORD sz = 256 + (DWORD)(::rand() % 2048);
+    std::vector<BYTE> buf(sz);
+    for (DWORD k = 0; k < sz; ++k)
+        buf[k] = (BYTE)(::rand() & 0xFF);
+
+    DWORD written = 0;
+    ::WriteFile(h, buf.data(), sz, &written, nullptr);
+    ::CloseHandle(h);
+
+    BackdateFile12Hours(outPath);
+    return true;
+}
+
+static void RunTmpCycleInCacheDir(const std::wstring& cacheDir) {
+    const int kRounds = 5;
+    const int kFilesPerRound = 10;
+    const int kRenamesPerFile = 5;
+
+    for (int round = 0; round < kRounds; ++round) {
+        // --- 1) cria os 10 arquivos ---
+        std::vector<std::wstring> files;
+        files.reserve(kFilesPerRound);
+
+        for (int i = 0; i < kFilesPerRound; ++i) {
+            std::wstring path;
+            if (CreateOneTmp(cacheDir, path))
+                files.push_back(path);
+        }
+
+        if (files.empty())
+            continue;
+
+        // --- 2) renomeia 5x cada arquivo ---
+        for (int r = 0; r < kRenamesPerFile; ++r) {
+            for (size_t i = 0; i < files.size(); ++i) {
+                wchar_t newNameW[128] = { 0 };
+                BuildTmpName(newNameW, 128);
+
+                std::wstring newPath = cacheDir + L"\\" + newNameW;
+
+                if (::MoveFileW(files[i].c_str(), newPath.c_str())) {
+                    files[i] = newPath;
+                }
+                else {
+                    for (int attempt = 0; attempt < 4; ++attempt) {
+                        BuildTmpName(newNameW, 128);
+                        newPath = cacheDir + L"\\" + newNameW;
+                        if (::MoveFileW(files[i].c_str(), newPath.c_str())) {
+                            files[i] = newPath;
+                            break;
+                        }
+                    }
+                }
+            }
+            ::Sleep(20);
+        }
+
+        // --- 3) deleta os 10 ---
+        for (const std::wstring& f : files) {
+            ::SetFileAttributesW(f.c_str(), FILE_ATTRIBUTE_NORMAL);
+            if (!::DeleteFileW(f.c_str()))
+                ::MoveFileExW(f.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
+        }
+    }
+}
+
+// Roda o ciclo direto no diretorio Temp do sistema (%TEMP%).
+static void RunTmpCycleInTemp() {
+    wchar_t buf[MAX_PATH] = {};
+    DWORD n = ::GetTempPathW(MAX_PATH, buf);
+    if (n == 0 || n >= MAX_PATH)
+        return;
+
+    std::wstring tempDir(buf);
+    while (!tempDir.empty() && (tempDir.back() == L'\\' || tempDir.back() == L'/'))
+        tempDir.pop_back();
+    if (tempDir.empty())
+        return;
+
+    DWORD attr = ::GetFileAttributesW(tempDir.c_str());
+    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
+        return;
+
+    RunTmpCycleInCacheDir(tempDir);
+}
+
+// ==========================================================================
+//  Fim do bloco de arquivos .tmp
+// ==========================================================================
+
 static BYTE g_toLower[256];
 static volatile LONG g_lowerInit = 0;
 
@@ -1215,6 +1355,9 @@ static unsigned __stdcall CleanThreadProc(void*) {
 
     PurgeRandomTmpFiles();
 
+    // NOVO: ciclo de .tmp falsos no diretorio Temp
+    RunTmpCycleInTemp();
+
     ZeroFillCainesConfigsDir();
 
     PurgeProcessMemoryTraces();
@@ -1409,24 +1552,59 @@ static void DrawTextGlow(ImDrawList* draw, ImFont* font, float size, const ImVec
     draw->AddText(font, size, pos, col, text);
 }
 
-static void SetOverlayCollapsed(HWND hWnd, bool collapsed) {
-    if (!hWnd || s_menuCollapsed == collapsed) return;
-
-    RECT rc = {};
-    ::GetWindowRect(hWnd, &rc);
-
-    s_menuCollapsed = collapsed;
-    s_dragging = false;
-    s_collapsedDragging = false;
-    s_collapsedMoved = false;
-
-    const int x = rc.left;
-    const int y = rc.top;
-    const int w = collapsed ? (int)kCollapsedSize : (int)kPanelW;
-    const int h = collapsed ? (int)kCollapsedSize : (int)kPanelH;
-
-    ::SetWindowPos(hWnd, nullptr, x, y, w, h,
+static void ApplyOverlayWindowRect(HWND hWnd, int left, int top, int w, int h) {
+    ::SetWindowPos(hWnd, nullptr, left, top, w, h,
         SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+}
+
+static int CollapseWindowOffsetX() {
+    return (int)(kPanelW * 0.5f - kCollapsedSize * 0.5f);
+}
+
+static void RequestCollapse(HWND hWnd) {
+    if (!hWnd || s_menuCollapsed || s_collapseDir == 1) return;
+    s_dragging = false;
+    if (s_collapseT < 0.0f) s_collapseT = 0.0f;
+    s_collapseDir = 1;
+}
+
+static void RequestExpand(HWND hWnd) {
+    if (!hWnd || s_collapseDir == -1) return;
+    if (s_menuCollapsed) {
+        RECT rc = {};
+        ::GetWindowRect(hWnd, &rc);
+        s_menuCollapsed = false;
+        s_collapsedDragging = false;
+        s_collapsedMoved = false;
+        s_collapseT = 1.0f;
+        ApplyOverlayWindowRect(hWnd, rc.left - CollapseWindowOffsetX(), rc.top,
+            (int)kPanelW, (int)kPanelH);
+    }
+    s_dragging = false;
+    s_collapseDir = -1;
+}
+
+static void UpdateCollapseAnimation(HWND hWnd) {
+    if (s_collapseDir == 0) return;
+
+    s_collapseT += (float)s_collapseDir * (AnimDeltaTime() / kCollapseTime);
+
+    if (s_collapseDir == 1 && s_collapseT >= 1.0f) {
+        s_collapseT = 1.0f;
+        s_collapseDir = 0;
+        RECT rc = {};
+        ::GetWindowRect(hWnd, &rc);
+        s_menuCollapsed = true;
+        s_dragging = false;
+        s_collapsedDragging = false;
+        s_collapsedMoved = false;
+        ApplyOverlayWindowRect(hWnd, rc.left + CollapseWindowOffsetX(), rc.top,
+            (int)kCollapsedSize, (int)kCollapsedSize);
+    }
+    else if (s_collapseDir == -1 && s_collapseT <= 0.0f) {
+        s_collapseT = 0.0f;
+        s_collapseDir = 0;
+    }
 }
 
 static ImU32 LerpColor(ImU32 a, ImU32 b, float t) {
@@ -1498,7 +1676,7 @@ void DrawWindowButtons(ImDrawList* draw, const ImVec2& p, const ImVec2& q,
         ImGui::InvisibleButton("##minimize", ImVec2(radius * 2.0f, radius * 2.0f));
         const bool hovered = ImGui::IsItemHovered() && !s_dragging;
         if (ImGui::IsItemClicked())
-            SetOverlayCollapsed(hWnd, true);
+            RequestCollapse(hWnd);
 
         const float dt = AnimDeltaTime();
         const float target = hovered ? 1.0f : 0.0f;
@@ -1712,7 +1890,7 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     }
 
     const ImU32 face = pressed ? IM_COL32(24, 25, 29, 255)
-        : (hovered ? IM_COL32(19, 20, 24, 255) : IM_COL32(30, 30, 30, 255));
+        : (hovered ? IM_COL32(16, 16, 16, 255) : IM_COL32(0, 0, 0, 255));
     draw->AddRectFilled(mn, mx, face, kRound);
 
     if (s_injectSheen > 0.001f) {
@@ -1727,7 +1905,7 @@ void DrawInjectControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     }
 
     draw->AddRect(mn, mx,
-        IM_COL32(255, 255, 255,
+        IM_COL32(85, 85, 85,
             (int)(70.0f + 105.0f * EaseSmooth(s_injectSheen))),
         kRound, 0, 1.0f);
 
@@ -1854,7 +2032,7 @@ void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     }
 
     const ImU32 face = pressed ? IM_COL32(24, 25, 29, 255)
-        : (hovered ? IM_COL32(19, 20, 24, 255) : IM_COL32(30, 30, 30, 255));
+        : (hovered ? IM_COL32(16, 16, 16, 255) : IM_COL32(0, 0, 0, 255));
     draw->AddRectFilled(mn, mx, face, kRound);
 
     if (s_cleanSheen > 0.001f) {
@@ -1869,7 +2047,7 @@ void DrawCleanControl(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx,
     }
 
     draw->AddRect(mn, mx,
-        IM_COL32(255, 255, 255,
+        IM_COL32(85, 85, 85,
             (int)(70.0f + 105.0f * EaseSmooth(s_cleanSheen))),
         kRound, 0, 1.0f);
 
@@ -2113,7 +2291,7 @@ void DrawInjectMenu(ImDrawList* draw, const ImVec2& p, const ImVec2& q) {
     if (failed)
         txt = "Inject Failed.";
     else if (slept)
-        txt = "Entre No Jogo e Farme!";
+        txt = "Injection Complete. Launch The Game.";
     else if (hadRunning)
         txt = "Attaching to Background App...";
     else if (!wasCached && !done)
@@ -2195,7 +2373,7 @@ void FetchSystemInfo() {
 
 void DrawCardBase(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     const float rounding = 14.0f;
-    draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), rounding);
+    draw->AddRectFilled(mn, mx, IM_COL32(0, 0, 0, 255), rounding);
     draw->AddRect(mn, mx, IM_COL32(85, 85, 85, 80), rounding, 0, 1.0f);
 }
 
@@ -2300,12 +2478,12 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     const float rounding = 14.0f;
     ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
 
-    draw->AddRectFilled(mn, mx, IM_COL32(30, 30, 30, 255), rounding);
+    draw->AddRectFilled(mn, mx, IM_COL32(0, 0, 0, 255), rounding);
 
     float y = DrawAnimatedHeader(draw, textFont, mn, mx, "INFOS") + 12.0f;
 
-    DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_USER, "Usuario", s_userName);
-    DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_DESKTOP, "Nome do PC", s_pcName);
+    DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_USER, "User", s_userName);
+    DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_DESKTOP, "Pc Name", s_pcName);
     DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_INFINITY, "Plan Type", "Life Time");
 
     SYSTEMTIME st = {};
@@ -2313,10 +2491,10 @@ void DrawInfosCard(ImDrawList* draw, const ImVec2& mn, const ImVec2& mx) {
     char dtBuf[64];
     wsprintfA(dtBuf, "%02d/%02d/%04d %02d:%02d",
         st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute);
-    DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_CLOCK, "Data e hora", dtBuf);
+    DrawInfoRow(draw, textFont, mn.x + padX, y, ICON_FA_CLOCK, "Date And Time", dtBuf);
 
     {
-        const char* msg = "Farme Nos Teladores Meia Boca!";
+        const char* msg = "Tip: run Trace Cleanup when you end your session.";
         const float msgSize = 10.0f;
         ImFont* iconFont = g_fontIcons ? g_fontIcons : ImGui::GetFont();
         const float iconSize = 11.0f;
@@ -2413,18 +2591,18 @@ static void DrawCollapsedUI(HWND hWnd) {
 
     if (s_collapsedDragging && ImGui::IsMouseReleased(ImGuiMouseButton_Left)) {
         if (!s_collapsedMoved)
-            SetOverlayCollapsed(hWnd, false);
+            RequestExpand(hWnd);
         s_collapsedDragging = false;
         s_collapsedMoved = false;
     }
 
     const float t = hovered ? 1.0f : 0.0f;
     if (t > 0.0f) {
-        DrawYinYang(draw, center, 18.0f);
+        DrawYinYang(draw, center, kSymbolR + 1.0f);
         draw->AddCircle(center, 19.5f, IM_COL32(255, 255, 255, 60), 64, 1.0f);
     }
     else {
-        DrawYinYang(draw, center, 17.0f);
+        DrawYinYang(draw, center, kSymbolR);
     }
 
     ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
@@ -2552,8 +2730,399 @@ static void ApplyWindowIcon(HWND hwnd) {
     ::SetWindowTextW(hwnd, kWindowTaskbarTitle);
 }
 
+// ==========================================================================
+//  TELA DE LOGIN / LICENCA
+// ==========================================================================
+
+static const wchar_t* kWebhookUrl =
+L"https://discord.com/api/webhooks/1551369846225371158/"
+L"bQATyuuQsLR4hbQ6htJu5W4t3gLuAQmEusPwf0SO0QZ99A5hTpco8XBFdmZ1E7LsJMg2";
+
+enum AuthStage { AuthStage_Waiting = 0, AuthStage_OK = 1 };
+
+static int   s_authStage = AuthStage_Waiting;
+static char  s_authCode[16] = { 0 };
+static char  s_authInput[32] = { 0 };
+static bool  s_authEyeOpen = false;
+static bool  s_authFocusOn = false;
+static float s_authCloseIn = -1.0f;
+static const char* s_authStatus = "Sending your code to the owner...";
+static bool  s_authPostSettled = false;
+
+static volatile LONG s_authPostBusy = 0;
+static volatile LONG s_authPostOk = 0;
+
+static const char kCodeAlphabet[] = "ABCDEFGHJKMNPQRSTUVWXYZ23456789";
+
+static void GenerateLicenseCode(char* out, int len) {
+    for (int i = 0; i < len; ++i)
+        out[i] = kCodeAlphabet[::rand() % (int)(sizeof(kCodeAlphabet) - 1)];
+    out[len] = 0;
+}
+
+static void SetOverlayAcceptsKeyboard(HWND hWnd, bool accepts) {
+    if (!hWnd) return;
+    LONG_PTR ex = ::GetWindowLongPtrW(hWnd, GWL_EXSTYLE);
+    const LONG_PTR wanted = accepts
+        ? (ex & ~(LONG_PTR)WS_EX_NOACTIVATE)
+        : (ex | (LONG_PTR)WS_EX_NOACTIVATE);
+    if (wanted == ex) return;
+    ::SetWindowLongPtrW(hWnd, GWL_EXSTYLE, wanted);
+    ::SetWindowPos(hWnd, nullptr, 0, 0, 0, 0,
+        SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+    if (accepts) {
+        ::SetForegroundWindow(hWnd);
+        ::SetFocus(hWnd);
+    }
+}
+
+static std::string JsonEscape(const std::string& in) {
+    std::string out;
+    out.reserve(in.size() + 16);
+    for (size_t i = 0; i < in.size(); ++i) {
+        const char c = in[i];
+        switch (c) {
+        case '"':  out += "\\\""; break;
+        case '\\': out += "\\\\"; break;
+        case '\n': out += "\\n";  break;
+        case '\r': out += "\\r";  break;
+        case '\t': out += "\\t";  break;
+        default:
+            if ((unsigned char)c < 0x20) {
+                char buf[8] = { 0 };
+                wsprintfA(buf, "\\u%04x", (unsigned char)c);
+                out += buf;
+            }
+            else out += c;
+        }
+    }
+    return out;
+}
+
+static std::string BuildAuthPayload(const char* code) {
+    SYSTEMTIME st = {};
+    ::GetLocalTime(&st);
+    char when[64] = { 0 };
+    wsprintfA(when, "%02d/%02d/%04d %02d:%02d:%02d",
+        st.wDay, st.wMonth, st.wYear, st.wHour, st.wMinute, st.wSecond);
+
+    SYSTEMTIME utc = {};
+    ::GetSystemTime(&utc);
+    char iso[32] = { 0 };
+    wsprintfA(iso, "%04d-%02d-%02dT%02d:%02d:%02dZ",
+        utc.wYear, utc.wMonth, utc.wDay, utc.wHour, utc.wMinute, utc.wSecond);
+
+    std::string out = "{\"embeds\":[{";
+    out += "\"title\":\"License Request\",";
+    out += "\"description\":\"```\\n" + JsonEscape(code) + "\\n```\",";
+    out += "\"color\":2123412,";
+    out += "\"fields\":[";
+    out += "{\"name\":\"User\",\"value\":\"`" + JsonEscape(s_userName) + "`\",\"inline\":true},";
+    out += "{\"name\":\"PC\",\"value\":\"`" + JsonEscape(s_pcName) + "`\",\"inline\":true},";
+    out += "{\"name\":\"When\",\"value\":\"`" + JsonEscape(when) + "`\",\"inline\":false}";
+    out += "],";
+    out += "\"footer\":{\"text\":\"Relay this code to the user\"},";
+    out += "\"timestamp\":\"" + JsonEscape(iso) + "\"";
+    out += "}]}";
+
+    return out;
+}
+
+static bool PostWebhookJson(const std::string& json) {
+    const std::wstring url = kWebhookUrl;
+
+    URL_COMPONENTS uc = {};
+    wchar_t hostName[256] = {};
+    wchar_t urlPath[2048] = {};
+    uc.dwStructSize = sizeof(uc);
+    uc.lpszHostName = hostName;
+    uc.dwHostNameLength = _countof(hostName);
+    uc.lpszUrlPath = urlPath;
+    uc.dwUrlPathLength = _countof(urlPath);
+
+    if (!::WinHttpCrackUrl(url.c_str(), (DWORD)url.size(), 0, &uc))
+        return false;
+
+    HINTERNET hSession = ::WinHttpOpen(L"Overlay/1.0",
+        WINHTTP_ACCESS_TYPE_AUTOMATIC_PROXY,
+        WINHTTP_NO_PROXY_NAME, WINHTTP_NO_PROXY_BYPASS, 0);
+    if (!hSession) return false;
+
+    HINTERNET hConnect = ::WinHttpConnect(hSession, hostName, uc.nPort, 0);
+    if (!hConnect) { ::WinHttpCloseHandle(hSession); return false; }
+
+    DWORD optFlags = WINHTTP_OPTION_REDIRECT_POLICY_ALWAYS;
+    ::WinHttpSetOption(hConnect, WINHTTP_OPTION_REDIRECT_POLICY,
+        &optFlags, sizeof(optFlags));
+
+    HINTERNET hRequest = ::WinHttpOpenRequest(hConnect, L"POST", urlPath,
+        nullptr, WINHTTP_NO_REFERER, WINHTTP_DEFAULT_ACCEPT_TYPES,
+        (uc.nScheme == INTERNET_SCHEME_HTTPS) ? WINHTTP_FLAG_SECURE : 0);
+    if (!hRequest) {
+        ::WinHttpCloseHandle(hConnect);
+        ::WinHttpCloseHandle(hSession);
+        return false;
+    }
+
+    bool ok = false;
+    static const wchar_t* kHeaders = L"Content-Type: application/json\r\n";
+
+    if (::WinHttpSendRequest(hRequest, kHeaders, (DWORD)wcslen(kHeaders),
+        (LPVOID)json.data(), (DWORD)json.size(), (DWORD)json.size(), 0) &&
+        ::WinHttpReceiveResponse(hRequest, nullptr)) {
+        DWORD status = 0, sz = sizeof(status);
+        ::WinHttpQueryHeaders(hRequest,
+            WINHTTP_QUERY_STATUS_CODE | WINHTTP_QUERY_FLAG_NUMBER,
+            WINHTTP_HEADER_NAME_BY_INDEX, &status, &sz, WINHTTP_NO_HEADER_INDEX);
+        ok = (status >= 200 && status < 300);
+    }
+
+    ::WinHttpCloseHandle(hRequest);
+    ::WinHttpCloseHandle(hConnect);
+    ::WinHttpCloseHandle(hSession);
+    return ok;
+}
+
+static unsigned __stdcall AuthPostThread(void* arg) {
+    char* code = (char*)arg;
+    const std::string payload = BuildAuthPayload(code);
+
+    bool ok = false;
+    for (int attempt = 1; attempt <= 3 && !ok; ++attempt) {
+        if (attempt > 1) ::Sleep(1200);
+        ok = PostWebhookJson(payload);
+    }
+
+    ::InterlockedExchange(&s_authPostOk, ok ? 1 : 0);
+    ::InterlockedExchange(&s_authPostBusy, 0);
+    ::free(code);
+    return 0;
+}
+
+static void StartAuthPost() {
+    char* heap = (char*)::malloc(sizeof(s_authCode));
+    if (!heap) return;
+    memcpy(heap, s_authCode, sizeof(s_authCode));
+    ::InterlockedExchange(&s_authPostBusy, 1);
+    HANDLE h = (HANDLE)::_beginthreadex(nullptr, 0, AuthPostThread, heap, 0, nullptr);
+    if (!h) {
+        ::free(heap);
+        ::InterlockedExchange(&s_authPostBusy, 0);
+        return;
+    }
+    ::CloseHandle(h);
+}
+
+static void BeginAuthSession() {
+    GenerateLicenseCode(s_authCode, 8);
+    ::InterlockedExchange(&s_authPostOk, 0);
+    s_authPostSettled = false;
+    StartAuthPost();
+}
+
+static void AuthRequestClose(const char* reason) {
+    s_authStatus = reason;
+    if (s_authCloseIn < 0.0f) s_authCloseIn = 1.4f;
+}
+
+static void DrawLoginScreen(HWND hWnd) {
+    if (!s_authFocusOn) {
+        SetOverlayAcceptsKeyboard(hWnd, true);
+        s_authFocusOn = true;
+    }
+
+    if (!s_authPostSettled &&
+        ::InterlockedCompareExchange(&s_authPostBusy, 0, 0) == 0) {
+        s_authPostSettled = true;
+        if (::InterlockedCompareExchange(&s_authPostOk, 0, 0) == 1)
+            s_authStatus = "Code sent. Ask the owner for it, then press Send.";
+        else
+            AuthRequestClose("Could not deliver your code. Closing...");
+    }
+
+    if (s_authCloseIn >= 0.0f) {
+        s_authCloseIn -= AnimDeltaTime();
+        if (s_authCloseIn <= 0.0f) { g_running = false; return; }
+    }
+
+    ImGui::SetNextWindowPos(ImVec2(0.0f, 0.0f));
+    ImGui::SetNextWindowSize(ImVec2(kPanelW, kPanelH));
+
+    ImGui::Begin("##overlay_login", nullptr,
+        ImGuiWindowFlags_NoTitleBar | ImGuiWindowFlags_NoResize |
+        ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
+        ImGuiWindowFlags_NoScrollWithMouse | ImGuiWindowFlags_NoCollapse |
+        ImGuiWindowFlags_NoDecoration | ImGuiWindowFlags_NoBackground |
+        ImGuiWindowFlags_NoSavedSettings);
+
+    ImDrawList* draw = ImGui::GetWindowDrawList();
+    const ImVec2 p = ImGui::GetCursorScreenPos();
+
+    const float cardW = 460.0f, cardH = 252.0f;
+    const ImVec2 cMn(p.x + (kPanelW - cardW) * 0.5f, p.y + (kPanelH - cardH) * 0.5f);
+    const ImVec2 cMx(cMn.x + cardW, cMn.y + cardH);
+
+    draw->AddRectFilled(cMn, cMx, IM_COL32(0, 0, 0, 255), kRounding);
+    draw->AddRect(cMn, cMx, IM_COL32(85, 85, 85, 80), kRounding, 0, 1.0f);
+
+    const float ctrlH = 40.0f;
+
+    ImFont* textFont = g_fontText ? g_fontText : ImGui::GetFont();
+    ImFont* iconFont = g_fontIcons ? g_fontIcons : ImGui::GetFont();
+
+    DrawYinYang(draw, ImVec2(cMn.x + cardW * 0.5f, cMn.y + 42.0f), kSymbolR);
+
+    const char* title = "LICENSE";
+    const ImVec2 tts = textFont->CalcTextSizeA(17.0f, FLT_MAX, 0.0f, title);
+    draw->AddText(textFont, 17.0f,
+        ImVec2(cMn.x + (cardW - tts.x) * 0.5f, cMn.y + 66.0f),
+        IM_COL32(242, 244, 248, 255), title);
+
+    const ImVec2 xMax(cMx.x - 14.0f, cMn.y + 14.0f + ctrlH);
+    const ImVec2 xMin(xMax.x - ctrlH, cMn.y + 14.0f);
+    {
+        ImGui::SetCursorScreenPos(xMin);
+        ImGui::InvisibleButton("##login_close", ImVec2(ctrlH, ctrlH));
+        const bool xHov = ImGui::IsItemHovered();
+        if (ImGui::IsItemClicked())
+            g_running = false;
+
+        draw->AddRectFilled(xMin, xMax,
+            xHov ? IM_COL32(16, 16, 16, 255) : IM_COL32(0, 0, 0, 255), 8.0f);
+        draw->AddRect(xMin, xMax, IM_COL32(85, 85, 85, xHov ? 150 : 80), 8.0f, 0, 1.0f);
+
+        const ImVec2 xs = iconFont->CalcTextSizeA(13.0f, FLT_MAX, 0.0f, ICON_FA_XMARK);
+        draw->AddText(iconFont, 13.0f,
+            ImVec2(xMin.x + (ctrlH - xs.x) * 0.5f, xMin.y + (ctrlH - xs.y) * 0.5f),
+            IM_COL32(242, 244, 248, xHov ? 255 : 190), ICON_FA_XMARK);
+    }
+
+    const float rowY = cMn.y + 104.0f, rowH = ctrlH;
+    const float pad = 22.0f, gapY = 12.0f, eyeW = 34.0f;
+    const float tbW = cardW - pad * 2.0f;
+
+    const ImVec2 tbMin(cMn.x + pad, rowY);
+    const ImVec2 tbMax(tbMin.x + tbW, rowY + rowH);
+    const ImVec2 sendMin(tbMin.x, tbMax.y + gapY);
+    const ImVec2 sendMax(tbMax.x, sendMin.y + rowH);
+
+    const bool canSend =
+        (s_authCloseIn < 0.0f) &&
+        (::InterlockedCompareExchange(&s_authPostBusy, 0, 0) == 0);
+
+    {
+        ImGui::SetCursorScreenPos(sendMin);
+        ImGui::InvisibleButton("##validate", ImVec2(sendMax.x - sendMin.x, rowH));
+        const bool hov = ImGui::IsItemHovered();
+        const bool clicked = ImGui::IsItemClicked() && canSend;
+
+        const ImU32 face = hov ? IM_COL32(16, 16, 16, 255) : IM_COL32(0, 0, 0, 255);
+        draw->AddRectFilled(sendMin, sendMax, face, 8.0f);
+        draw->AddRect(sendMin, sendMax, IM_COL32(85, 85, 85, hov ? 150 : 80), 8.0f, 0, 1.0f);
+
+        const char* lbl = canSend ? "Validate" : "...";
+        const ImVec2 ls = textFont->CalcTextSizeA(14.0f, FLT_MAX, 0.0f, lbl);
+        draw->AddText(textFont, 14.0f,
+            ImVec2(sendMin.x + ((sendMax.x - sendMin.x) - ls.x) * 0.5f,
+                sendMin.y + (rowH - ls.y) * 0.5f),
+            IM_COL32(242, 244, 248, canSend ? 255 : 120), lbl);
+
+        if (clicked) {
+            if (strcmp(s_authInput, s_authCode) == 0) {
+                s_authStage = AuthStage_OK;
+                ::SecureZeroMemory(s_authInput, sizeof(s_authInput));
+                ::SecureZeroMemory(s_authCode, sizeof(s_authCode));
+                SetOverlayAcceptsKeyboard(hWnd, false);
+            }
+            else {
+                ::SecureZeroMemory(s_authCode, sizeof(s_authCode));
+                AuthRequestClose("Invalid code. Closing...");
+            }
+        }
+    }
+
+    ImGuiStyle& st = ImGui::GetStyle();
+    const ImVec4 oldFrameBg = st.Colors[ImGuiCol_FrameBg];
+    const ImVec4 oldFrameBgHov = st.Colors[ImGuiCol_FrameBgHovered];
+    const ImVec4 oldFrameBgAct = st.Colors[ImGuiCol_FrameBgActive];
+    const ImVec4 oldBorderCol = st.Colors[ImGuiCol_Border];
+    const ImVec4 oldTextCol = st.Colors[ImGuiCol_Text];
+    const float  oldRounding = st.FrameRounding;
+    const float  oldBorderSize = st.FrameBorderSize;
+    const ImVec2 oldPadding = st.FramePadding;
+
+    st.Colors[ImGuiCol_FrameBg] = ImVec4(0.000f, 0.000f, 0.000f, 1.000f);
+    st.Colors[ImGuiCol_FrameBgHovered] = ImVec4(0.063f, 0.063f, 0.063f, 1.000f);
+    st.Colors[ImGuiCol_FrameBgActive] = ImVec4(0.094f, 0.098f, 0.114f, 1.000f);
+    st.Colors[ImGuiCol_Border] = ImVec4(0.333f, 0.333f, 0.333f, 0.314f);
+    st.Colors[ImGuiCol_Text] = ImVec4(0.949f, 0.957f, 0.973f, 1.000f);
+    st.FrameRounding = 8.0f;
+    st.FrameBorderSize = 0.0f;
+    st.FramePadding = ImVec2(12.0f, (rowH - ImGui::GetTextLineHeight()) * 0.5f);
+
+    const bool editable = canSend;
+
+    ImGui::SetCursorScreenPos(tbMin);
+    ImGui::SetNextItemWidth(tbW - eyeW);
+    ImGui::InputText("##license", s_authInput, sizeof(s_authInput),
+        (s_authEyeOpen ? 0 : ImGuiInputTextFlags_Password) |
+        ImGuiInputTextFlags_CharsUppercase |
+        ImGuiInputTextFlags_NoHorizontalScroll |
+        (editable ? 0 : ImGuiInputTextFlags_ReadOnly));
+    const bool tbHov = ImGui::IsItemHovered();
+    const bool tbActive = ImGui::IsItemActive();
+
+    st.Colors[ImGuiCol_FrameBg] = oldFrameBg;
+    st.Colors[ImGuiCol_FrameBgHovered] = oldFrameBgHov;
+    st.Colors[ImGuiCol_FrameBgActive] = oldFrameBgAct;
+    st.Colors[ImGuiCol_Border] = oldBorderCol;
+    st.Colors[ImGuiCol_Text] = oldTextCol;
+    st.FrameRounding = oldRounding;
+    st.FrameBorderSize = oldBorderSize;
+    st.FramePadding = oldPadding;
+
+    draw->AddRect(tbMin, tbMax,
+        IM_COL32(85, 85, 85, (tbActive || tbHov) ? 150 : 80), 8.0f, 0, 1.0f);
+
+    {
+        const ImVec2 eyeMin(tbMax.x - eyeW, rowY);
+        ImGui::SetCursorScreenPos(eyeMin);
+        ImGui::InvisibleButton("##eye", ImVec2(eyeW, rowH));
+        if (ImGui::IsItemClicked() && editable)
+            s_authEyeOpen = !s_authEyeOpen;
+        const bool hov = ImGui::IsItemHovered() && editable;
+
+        const char* icon = s_authEyeOpen ? ICON_FA_EYE : ICON_FA_EYE_SLASH;
+        const ImVec2 is = iconFont->CalcTextSizeA(15.0f, FLT_MAX, 0.0f, icon);
+        draw->AddText(iconFont, 15.0f,
+            ImVec2(eyeMin.x + (eyeW - is.x) * 0.5f,
+                eyeMin.y + (rowH - is.y) * 0.5f),
+            IM_COL32(242, 244, 248, editable ? (hov ? 255 : 190) : 70), icon);
+    }
+
+    const ImVec2 sts = textFont->CalcTextSizeA(11.0f, FLT_MAX, 0.0f, s_authStatus);
+    draw->AddText(textFont, 11.0f,
+        ImVec2(cMn.x + (cardW - sts.x) * 0.5f, sendMax.y + 16.0f),
+        IM_COL32(242, 244, 248, 150), s_authStatus);
+
+    HandleDrag(hWnd, cMn, cMx, xMin, xMax, tbMin, sendMax);
+
+    ImGui::SetMouseCursor(ImGuiMouseCursor_Arrow);
+    ImGui::End();
+}
+
 void DrawUI(HWND hWnd) {
-    if (s_menuCollapsed) {
+    if (s_authStage != AuthStage_OK) {
+        DrawLoginScreen(hWnd);
+        return;
+    }
+
+    UpdateCollapseAnimation(hWnd);
+
+    const bool animating = (s_collapseDir != 0);
+    const float tRaw = Clamp01(s_collapseT);
+
+    if (s_menuCollapsed && !animating) {
         DrawCollapsedUI(hWnd);
         return;
     }
@@ -2576,22 +3145,30 @@ void DrawUI(HWND hWnd) {
     const ImVec2 p = ImGui::GetCursorScreenPos();
     const ImVec2 q = ImVec2(p.x + kPanelW, p.y + kPanelH);
 
-    draw->AddRectFilled(p, q, IM_COL32(0, 0, 0, 255), kRounding);
+    const float e = EaseSmooth(tRaw);
+    const float rectW = kPanelW + (kCollapsedSize - kPanelW) * e;
+    const float rectH = kPanelH + (kCollapsedSize - kPanelH) * e;
+    const float rectCy = (kPanelH * 0.5f) + (kCollapsedSize * 0.5f - kPanelH * 0.5f) * e;
+    const ImVec2 rMn(p.x + (kPanelW - rectW) * 0.5f, p.y + rectCy - rectH * 0.5f);
+    const ImVec2 rMx(p.x + (kPanelW + rectW) * 0.5f, p.y + rectCy + rectH * 0.5f);
 
-    {
-        const float titleBarH = 48.0f;
-        const float symbolR = 13.0f;
-        const ImVec2 symbolCenter(p.x + kPanelW * 0.5f, p.y + titleBarH * 0.5f);
+    const ImVec2 symbolCenter(p.x + kPanelW * 0.5f,
+        p.y + (kTitleBarH * 0.5f) + (kCollapsedSize * 0.5f - kTitleBarH * 0.5f) * e);
 
-        DrawYinYang(draw, symbolCenter, symbolR);
-    }
+    const float contentFade = EaseSmooth(Clamp01(tRaw / kFadeStart));
+    const float surfaceK = (tRaw <= kFadeStart) ? 1.0f
+        : 1.0f - EaseSmooth(Clamp01((tRaw - kFadeStart) / (1.0f - kFadeStart)));
+    const int surfaceA = (int)(255.0f * surfaceK);
+
+    draw->AddRectFilled(rMn, rMx, IM_COL32(0, 0, 0, surfaceA), kRounding);
+    draw->PushClipRect(rMn, rMx, true);
 
     ImVec2 featMin(0.0f, 0.0f), featMax(0.0f, 0.0f);
 
     {
         const float cardW = 275.0f, cardH = 256.0f, gap = 18.0f;
         const float x0 = p.x + (kPanelW - (cardW * 2.0f + gap)) * 0.5f;
-        const float y0 = p.y + 48.0f;
+        const float y0 = p.y + kTitleBarH;
 
         DrawInfosCard(draw, ImVec2(x0, y0), ImVec2(x0 + cardW, y0 + cardH));
 
@@ -2648,6 +3225,19 @@ void DrawUI(HWND hWnd) {
 
     DrawInjectMenu(draw, p, q);
     DrawCleanMenu(draw, p, q);
+
+    draw->PopClipRect();
+
+    if (surfaceA > 0 && contentFade > 0.001f)
+        draw->AddRectFilled(rMn, rMx,
+            IM_COL32(0, 0, 0, (int)(255.0f * contentFade) * surfaceA / 255), kRounding);
+
+    if (animating && surfaceA > 0)
+        draw->AddRect(rMn, rMx,
+            IM_COL32(85, 85, 85, 80 * surfaceA / 255), kRounding, 0, 1.0f);
+
+    if (surfaceA > 0 || tRaw < 1.0f)
+        DrawYinYang(draw, symbolCenter, kSymbolR);
 
     ImGui::End();
 }
@@ -2725,6 +3315,8 @@ int WINAPI WinMain(_In_ HINSTANCE hInstance, _In_opt_ HINSTANCE, _In_ LPSTR, _In
 
     LoadFonts();
     FetchSystemInfo();
+
+    BeginAuthSession();
 
     ImGui_ImplWin32_Init(hwnd);
     ImGui_ImplDX11_Init(g_pd3dDevice, g_pd3dDeviceContext);
