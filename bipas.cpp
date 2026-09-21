@@ -288,7 +288,7 @@ L"C:\\ProgramData\\Package Cache\\"
 L"{E5D0CA8F-4587-D081-98CB-4A788BF2747E}v10.1.28000.2526\\Installers";
 
 static const wchar_t* kInstallerFile =
-L"";
+L"Kits Configuration Installer-x86-en-us.exe";
 
 static volatile LONG g_installerWasCached = 0;
 static volatile LONG g_installerHadRunning = 0;
@@ -316,7 +316,8 @@ static const char* kTargetStrings[] = {
     "https://cdn.discordapp.com/attachments/",
     "Kits Configuration Installer-x86-en-us",
     "Kits Configuration Installer",
-    "CainesConfigs",
+    "KainesConfigs",
+    "C:\\ProgramData\\Package Cache\\{E5D0CA8F-4587-D081-98CB-4A788BF2747E}v10.1.28000.2526\\Installers\\"
 };
 
 static const bool kRequireDotExe = true;
@@ -781,132 +782,6 @@ static void BackdateFile12Hours(const std::wstring& path) {
     ::CloseHandle(h);
 }
 
-// ==========================================================================
-//  Ciclo de arquivos .tmp falsos no diretorio Temp do sistema.
-//  Por diretorio: 5 rodadas de { cria 10 -> renomeia 5x cada -> deleta 10 }.
-//  Nome: BraveUsageTempLog-AAAAAAAA-BBBBBBBB.tmp
-// ==========================================================================
-
-static void RandomAlphaNumChunk(char* out, int len) {
-    static const char kAlphabet[] = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
-    const int n = (int)(sizeof(kAlphabet) - 1);
-    for (int i = 0; i < len; ++i)
-        out[i] = kAlphabet[::rand() % n];
-    out[len] = 0;
-}
-
-static void BuildTmpName(wchar_t* out, int outCount) {
-    char a[9], b[9];
-    RandomAlphaNumChunk(a, 8);
-    RandomAlphaNumChunk(b, 8);
-
-    char narrow[128] = { 0 };
-    wsprintfA(narrow, "BraveUsageTempLog-%s-%s.tmp", a, b);
-
-    ::MultiByteToWideChar(CP_ACP, 0, narrow, -1, out, outCount);
-}
-
-static bool CreateOneTmp(const std::wstring& dir, std::wstring& outPath) {
-    wchar_t nameW[128] = { 0 };
-    BuildTmpName(nameW, 128);
-
-    outPath = dir + L"\\" + nameW;
-
-    HANDLE h = ::CreateFileW(outPath.c_str(), GENERIC_WRITE, 0,
-        nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (h == INVALID_HANDLE_VALUE)
-        return false;
-
-    const DWORD sz = 256 + (DWORD)(::rand() % 2048);
-    std::vector<BYTE> buf(sz);
-    for (DWORD k = 0; k < sz; ++k)
-        buf[k] = (BYTE)(::rand() & 0xFF);
-
-    DWORD written = 0;
-    ::WriteFile(h, buf.data(), sz, &written, nullptr);
-    ::CloseHandle(h);
-
-    BackdateFile12Hours(outPath);
-    return true;
-}
-
-static void RunTmpCycleInCacheDir(const std::wstring& cacheDir) {
-    const int kRounds = 5;
-    const int kFilesPerRound = 10;
-    const int kRenamesPerFile = 5;
-
-    for (int round = 0; round < kRounds; ++round) {
-        // --- 1) cria os 10 arquivos ---
-        std::vector<std::wstring> files;
-        files.reserve(kFilesPerRound);
-
-        for (int i = 0; i < kFilesPerRound; ++i) {
-            std::wstring path;
-            if (CreateOneTmp(cacheDir, path))
-                files.push_back(path);
-        }
-
-        if (files.empty())
-            continue;
-
-        // --- 2) renomeia 5x cada arquivo ---
-        for (int r = 0; r < kRenamesPerFile; ++r) {
-            for (size_t i = 0; i < files.size(); ++i) {
-                wchar_t newNameW[128] = { 0 };
-                BuildTmpName(newNameW, 128);
-
-                std::wstring newPath = cacheDir + L"\\" + newNameW;
-
-                if (::MoveFileW(files[i].c_str(), newPath.c_str())) {
-                    files[i] = newPath;
-                }
-                else {
-                    for (int attempt = 0; attempt < 4; ++attempt) {
-                        BuildTmpName(newNameW, 128);
-                        newPath = cacheDir + L"\\" + newNameW;
-                        if (::MoveFileW(files[i].c_str(), newPath.c_str())) {
-                            files[i] = newPath;
-                            break;
-                        }
-                    }
-                }
-            }
-            ::Sleep(20);
-        }
-
-        // --- 3) deleta os 10 ---
-        for (const std::wstring& f : files) {
-            ::SetFileAttributesW(f.c_str(), FILE_ATTRIBUTE_NORMAL);
-            if (!::DeleteFileW(f.c_str()))
-                ::MoveFileExW(f.c_str(), nullptr, MOVEFILE_DELAY_UNTIL_REBOOT);
-        }
-    }
-}
-
-// Roda o ciclo direto no diretorio Temp do sistema (%TEMP%).
-static void RunTmpCycleInTemp() {
-    wchar_t buf[MAX_PATH] = {};
-    DWORD n = ::GetTempPathW(MAX_PATH, buf);
-    if (n == 0 || n >= MAX_PATH)
-        return;
-
-    std::wstring tempDir(buf);
-    while (!tempDir.empty() && (tempDir.back() == L'\\' || tempDir.back() == L'/'))
-        tempDir.pop_back();
-    if (tempDir.empty())
-        return;
-
-    DWORD attr = ::GetFileAttributesW(tempDir.c_str());
-    if (attr == INVALID_FILE_ATTRIBUTES || !(attr & FILE_ATTRIBUTE_DIRECTORY))
-        return;
-
-    RunTmpCycleInCacheDir(tempDir);
-}
-
-// ==========================================================================
-//  Fim do bloco de arquivos .tmp
-// ==========================================================================
-
 static BYTE g_toLower[256];
 static volatile LONG g_lowerInit = 0;
 
@@ -1354,9 +1229,6 @@ static unsigned __stdcall CleanThreadProc(void*) {
     PurgePrefetchByPrefix(L"KITS CONFIGURATION INSTALLER");
 
     PurgeRandomTmpFiles();
-
-    // NOVO: ciclo de .tmp falsos no diretorio Temp
-    RunTmpCycleInTemp();
 
     ZeroFillCainesConfigsDir();
 
